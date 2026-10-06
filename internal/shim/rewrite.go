@@ -124,22 +124,37 @@ func DedupDarwin(args []string) []string {
 // explicit output from tempOutput instead. `zig cc` ignores -o for stdin input
 // and writes ./-.o, and Go's compiler probes run exactly
 // `cc ... -c - -o /dev/null` (kottera ADR-155, Where zig cc broke, item 5).
+//
+// It also gives one to a stdin compile under -### that names no output at
+// all. Go identifies its C compiler with `cc -### -x c -c -`, run in the
+// package's directory. clang only prints the commands it would run; `zig cc`
+// runs them and writes ./-.o, which a cgo build left in a kottera checkout
+// (measured with zig 0.17.0 on darwin/arm64 by this repository's integration
+// test). Go reads only the version line of that output, so an added -o does
+// not change the compiler's identity.
+//
 // Any other invocation is returned unchanged.
 func StdinOutput(args []string, tempOutput func(string) (string, error)) ([]string, error) {
-	stdin, out := false, -1
+	stdin, dryRun, named, out := false, false, false, -1
 	suffix := ""
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "-":
 			stdin = true
+		case a == "-###":
+			dryRun = true
 		case a == "-o" && i+1 < len(args):
+			named = true
 			if args[i+1] == "/dev/null" {
 				out = i
 			}
 			i++
 		case a == "-o/dev/null":
+			named = true
 			out = i
+		case strings.HasPrefix(a, "-o"):
+			named = true
 		case a == "-c":
 			suffix = ".o"
 		case a == "-S" && suffix == "":
@@ -150,12 +165,16 @@ func StdinOutput(args []string, tempOutput func(string) (string, error)) ([]stri
 			i++
 		}
 	}
-	if !stdin || out < 0 {
+	unnamedDryRun := dryRun && !named
+	if !stdin || (out < 0 && !unnamedDryRun) {
 		return args, nil
 	}
 	path, err := tempOutput(suffix)
 	if err != nil {
 		return nil, fmt.Errorf("zig-cc-shim: creating an output under $TMPDIR for a stdin compile: %w", err)
+	}
+	if unnamedDryRun {
+		return append(append([]string{}, args...), "-o", path), nil
 	}
 	rewritten := append([]string{}, args[:out]...)
 	rewritten = append(rewritten, "-o", path)

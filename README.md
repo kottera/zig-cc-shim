@@ -16,6 +16,28 @@ It checks `gofmt -l .` and `go mod tidy -diff`, runs `go vet ./...` and a `CGO_E
 
 CI (`.github/workflows/gate.yml`) runs it on the repository's self-hosted runners, `[self-hosted, macOS, ARM64]` and `[self-hosted, Linux, X64]`. Hosted runners are never used: the organisation's hosted-runner billing is blocked, so a hosted job is never started.
 
+## The integration tests
+
+`cmd/stage/zig_test.go` runs the staged shim in front of a real zig. They need two environment variables:
+
+| Variable | Names | Without it |
+|---|---|---|
+| `ZIG_CC_SHIM_TEST_ZIG` | the `zig` executable of an unpacked zig release, beside its `lib/` | every integration test skips, naming the variable |
+| `ZIG_CC_SHIM_TEST_KOTTERA` | a `kottera/kottera` checkout | the darwin `go test -race ./pkg/toolchain` proof skips, naming the variable |
+
+With `KOTTERA_TEST_BARE_HOST=1` (kottera ADR-151 D3), a missing variable fails the test instead of skipping it. CI sets none of these, so there the integration tests skip with their reason, and nothing in CI downloads zig. `CC_TOOLCHAIN_TARGET_GLIBC` and `CC_TOOLCHAIN_TARGET_MACOS` default to `2.31` and `13.0` when unset.
+
+```
+ZIG_CC_SHIM_TEST_ZIG=~/zig-0.17.0/zig ZIG_CC_SHIM_TEST_KOTTERA=~/src/kottera KOTTERA_TEST_BARE_HOST=1 \
+  go test -count=1 -v -timeout 30m -run Zig ./cmd/stage
+```
+
+Each test stages the shim with `cmd/stage` into a temporary store whose `zig/` is a symlink to the release's directory, so nothing is written into the release. Then:
+
+- `TestZigEndToEnd`: `cc` and `c++` compile, link and run a C and a C++ program; `ar` builds an archive that a program links; Go's two stdin probes (`-c - -o /dev/null` and `-### -x c -c -`) leave nothing in their working directory; `--tera-describe` reports `zig version`'s output and the host target.
+- `TestZigKotteraRaceOnDarwin` (darwin only): a control arm runs `go test -race -count=1 ./pkg/toolchain` in the checkout with `CC` at bare `zig cc`, given the same target and SDK flags but no de-duplication, and asserts that it fails with dyld's `duplicate linked dylib` CoreFoundation abort. Then the same command with `CC` and `CXX` at the shim must pass, and must not leave a `-.o` in the checkout.
+- `TestZigCgoRaceGlibcCeiling`: builds a cgo program with `-race` through the shim and asserts that the highest `GLIBC_` version it requires is at or below `CC_TOOLCHAIN_TARGET_GLIBC`. On Linux it builds natively and runs the program. Elsewhere it cross-builds for linux/amd64 with `x86_64-unknown-linux-gnu-cc` and only reads the ELF. It does not cross-build for linux/arm64: with zig 0.17.0 that `-race` link fails, because Go's linux/arm64 race runtime needs libgcc's outline atomics (`__aarch64_ldadd8_sync` and others), which zig does not supply.
+
 ## Roles
 
 The shim chooses what to run from the basename of `argv[0]`:
@@ -72,7 +94,9 @@ Repeated `-framework X` and `-lX` (or `-l X`) arguments are de-duplicated, keepi
 
 ## Compiles from stdin
 
-`zig cc` ignores `-o` for stdin input and writes `./-.o`, and Go's compiler probes run `cc … -c - -o /dev/null`. When the input is `-` and the output is `/dev/null`, the shim gives zig a fresh output under `$TMPDIR` instead (`zig-cc-shim-stdin-*.o`). The shim has already become zig by then, so it cannot remove that file. It is small, and it lives in the temporary directory.
+`zig cc` ignores `-o` for stdin input and writes `./-.o`, and Go's compiler probes run `cc … -c - -o /dev/null`. When the input is `-` and the output is `/dev/null`, the shim gives zig a fresh output under `$TMPDIR` instead (`zig-cc-shim-stdin-*.o`). Go also identifies its compiler with `cc -### -x c -c -`, run in the package's directory. clang only prints the commands it would run, but `zig cc` runs them and writes `./-.o`. So a stdin compile under `-###` that names no output gets one under `$TMPDIR` too. Go reads only the version line of that output, so the compiler's identity does not change. The integration tests found this: a cgo `go test -race` of a kottera checkout through the shim left a `-.o` in the checkout.
+
+The shim has already become zig by then, so it cannot remove that file. It is small, and it lives in the temporary directory.
 
 ## The glibc floor on Linux
 
