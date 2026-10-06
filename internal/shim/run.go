@@ -120,7 +120,7 @@ func RealHost() Host {
 			Xcrun:  xcrun,
 		},
 		TempOutput: func(suffix string) (string, error) {
-			f, err := os.CreateTemp("", "zig-cc-shim-stdin-*"+suffix)
+			f, err := os.CreateTemp("", "zig-cc-shim-out-*"+suffix)
 			if err != nil {
 				return "", err
 			}

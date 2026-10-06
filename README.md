@@ -92,11 +92,17 @@ zig turns `--sysroot` into the linker's `-syslibroot`, and resolves the absolute
 
 Repeated `-framework X` and `-lX` (or `-l X`) arguments are de-duplicated, keeping the first. zig's Mach-O linker otherwise links the dylib twice, and dyld aborts with `duplicate linked dylib CoreFoundation`. This is for darwin targets only: on Linux a repeated static library can matter, so it is left alone.
 
-## Compiles from stdin
+## Compiles to /dev/null
 
-`zig cc` ignores `-o` for stdin input and writes `./-.o`, and Go's compiler probes run `cc … -c - -o /dev/null`. When the input is `-` and the output is `/dev/null`, the shim gives zig a fresh output under `$TMPDIR` instead (`zig-cc-shim-stdin-*.o`). Go also identifies its compiler with `cc -### -x c -c -`, run in the package's directory. clang only prints the commands it would run, but `zig cc` runs them and writes `./-.o`. So a stdin compile under `-###` that names no output gets one under `$TMPDIR` too. Go reads only the version line of that output, so the compiler's identity does not change. The integration tests found this: a cgo `go test -race` of a kottera checkout through the shim left a `-.o` in the checkout.
+`zig cc` does not honour `-o /dev/null`: it writes the object into the working directory instead, `<basename>.o` for a source file (`a.o` for `-c a.c -o /dev/null`, one combined `a.o` for `-c a.c b.c -o /dev/null`, `a.s` under `-S`) and `./-.o` for stdin input. Go's compiler probes run `cc … -c - -o /dev/null`, and other build tools probe a flag by compiling a file to `/dev/null`. So whenever a compile's output is `/dev/null` (`-o /dev/null` or `-o/dev/null`), whatever its input, the shim gives zig a fresh output under `$TMPDIR` instead (`zig-cc-shim-out-*.o`, `.s` under `-S`, `.i` under `-E`). kottera's bare-host measurement W1-A2 found the leak for every input with zig 0.17.0 on x86_64 Linux. W1-C6 reproduced it on darwin/arm64 for a Linux target.
+
+Go also identifies its compiler with `cc -### -x c -c -`, run in the package's directory. clang only prints the commands it would run, but `zig cc` runs them and writes `./-.o`. So a stdin compile under `-###` that names no output gets one under `$TMPDIR` too. Go reads only the version line of that output, so the compiler's identity does not change. The integration tests found this: a cgo `go test -race` of a kottera checkout through the shim left a `-.o` in the checkout.
 
 The shim has already become zig by then, so it cannot remove that file. It is small, and it lives in the temporary directory.
+
+## x86-64 micro-architecture levels
+
+gcc and clang spell the x86-64 levels `-march=x86-64`, `-march=x86-64-v2`, `-march=x86-64-v3` and `-march=x86-64-v4`, and the Rust `cc` crate passes `-march=<target-cpu>` in that spelling. zig 0.17.0 rejects it (`unknown CPU: 'x86'`) and wants `x86_64`, `x86_64_v2`, `x86_64_v3` and `x86_64_v4`. For an x86_64 target the shim translates those four values to zig's spelling. Any other `-march` value is passed through untouched. Nothing is rewritten for an aarch64 target.
 
 ## The glibc floor on Linux
 

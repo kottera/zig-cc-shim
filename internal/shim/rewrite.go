@@ -16,7 +16,8 @@ type Host struct {
 	// SDK resolves the darwin SDK. Its Getenv is the same as Host's.
 	SDK SDKProbe
 	// TempOutput returns a fresh path under $TMPDIR with the given suffix,
-	// for a stdin compile whose output would otherwise be ./-.o.
+	// for a compile to /dev/null whose output would otherwise land in the
+	// working directory.
 	TempOutput func(suffix string) (string, error)
 }
 
@@ -34,11 +35,12 @@ type Plan struct {
 //
 // For a compile role it supplies -target from the environment, checks the
 // glibc floor on a Linux host building for Linux, and for a darwin target
-// adds the SDK flags and de-duplicates -framework X and -lX. On every
-// platform, a stdin compile to /dev/null is given an output under $TMPDIR.
-// Nothing else is added: no host search path, and none of the rewrites of
-// Uber's wrapper (-u SYMBOL, -l:file, C++'s default UBSan), which are adopted
-// only where a measurement hits them.
+// adds the SDK flags and de-duplicates -framework X and -lX. For an x86_64
+// target it respells gcc's -march=x86-64[-vN] as zig's. On every platform, a
+// compile to /dev/null is given an output under $TMPDIR. Nothing else is
+// added: no host search path, and none of the rewrites of Uber's wrapper
+// (-u SYMBOL, -l:file, C++'s default UBSan), which are adopted only where a
+// measurement hits them.
 func Rewrite(role Role, args []string, h Host) (Plan, error) {
 	if !role.Compiles() {
 		return Plan{Args: append([]string{string(role.Driver)}, args...)}, nil
@@ -63,7 +65,10 @@ func Rewrite(role Role, args []string, h Host) (Plan, error) {
 		plan.Args = append(plan.Args, DarwinFlags(sdk)...)
 		args = DedupDarwin(args)
 	}
-	args, err = StdinOutput(args, h.TempOutput)
+	if target.Arch == "amd64" {
+		args = MarchX86(args)
+	}
+	args, err = DevNullOutput(args, h.TempOutput)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -120,10 +125,42 @@ func DedupDarwin(args []string) []string {
 	return out
 }
 
-// StdinOutput gives a compile that reads stdin and writes to /dev/null an
-// explicit output from tempOutput instead. `zig cc` ignores -o for stdin input
-// and writes ./-.o, and Go's compiler probes run exactly
-// `cc ... -c - -o /dev/null` (kottera ADR-155, Where zig cc broke, item 5).
+// marchX86 is gcc's and clang's x86-64 micro-architecture levels, spelled as
+// zig spells them.
+var marchX86 = map[string]string{
+	"x86-64":    "x86_64",
+	"x86-64-v2": "x86_64_v2",
+	"x86-64-v3": "x86_64_v3",
+	"x86-64-v4": "x86_64_v4",
+}
+
+// MarchX86 respells -march=x86-64, -march=x86-64-v2, -march=x86-64-v3 and
+// -march=x86-64-v4 as zig's x86_64, x86_64_v2, x86_64_v3 and x86_64_v4. zig 0.17.0 rejects the gcc spelling with
+// "unknown CPU: 'x86'" (kottera W1-A2, divergence row 21), and the Rust cc
+// crate passes -march=<target-cpu> in it. Every other -march value is
+// returned unchanged. It is for x86_64 targets only.
+func MarchX86(args []string) []string {
+	out := append([]string{}, args...)
+	for i := 0; i < len(out); i++ {
+		a := out[i]
+		if takesValue[a] {
+			i++
+			continue
+		}
+		if level, ok := strings.CutPrefix(a, "-march="); ok && marchX86[level] != "" {
+			out[i] = "-march=" + marchX86[level]
+		}
+	}
+	return out
+}
+
+// DevNullOutput gives a compile that writes to /dev/null an explicit output
+// from tempOutput instead. `zig cc` does not honour -o /dev/null: it writes
+// <basename>.o (or .s) into the working directory, and ./-.o for stdin input.
+// Go's compiler probes run exactly `cc ... -c - -o /dev/null` (kottera
+// ADR-155, Where zig cc broke, item 5), and kottera W1-A2 measured the
+// general case with zig 0.17.0 on x86_64 Linux: `-o /dev/null` leaks for any
+// input, one source file or several.
 //
 // It also gives one to a stdin compile under -### that names no output at
 // all. Go identifies its C compiler with `cc -### -x c -c -`, run in the
@@ -134,7 +171,7 @@ func DedupDarwin(args []string) []string {
 // not change the compiler's identity.
 //
 // Any other invocation is returned unchanged.
-func StdinOutput(args []string, tempOutput func(string) (string, error)) ([]string, error) {
+func DevNullOutput(args []string, tempOutput func(string) (string, error)) ([]string, error) {
 	stdin, dryRun, named, out := false, false, false, -1
 	suffix := ""
 	for i := 0; i < len(args); i++ {
@@ -165,13 +202,13 @@ func StdinOutput(args []string, tempOutput func(string) (string, error)) ([]stri
 			i++
 		}
 	}
-	unnamedDryRun := dryRun && !named
-	if !stdin || (out < 0 && !unnamedDryRun) {
+	unnamedDryRun := stdin && dryRun && !named
+	if out < 0 && !unnamedDryRun {
 		return args, nil
 	}
 	path, err := tempOutput(suffix)
 	if err != nil {
-		return nil, fmt.Errorf("zig-cc-shim: creating an output under $TMPDIR for a stdin compile: %w", err)
+		return nil, fmt.Errorf("zig-cc-shim: creating an output under $TMPDIR, so that zig writes nothing into the working directory: %w", err)
 	}
 	if unnamedDryRun {
 		return append(append([]string{}, args...), "-o", path), nil

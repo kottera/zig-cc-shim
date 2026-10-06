@@ -39,7 +39,7 @@ func fakeHost(p Platform, env map[string]string) Host {
 			IsDir:  func(d string) bool { return d == fakeSDK },
 			Xcrun:  func() (string, error) { return fakeSDK, nil },
 		},
-		TempOutput: func(suffix string) (string, error) { return "/tmpdir/zig-cc-shim-stdin-1" + suffix, nil },
+		TempOutput: func(suffix string) (string, error) { return "/tmpdir/zig-cc-shim-out-1" + suffix, nil },
 	}
 }
 
@@ -196,7 +196,7 @@ func TestRewriteDedupIsDarwinOnly(t *testing.T) {
 	}
 }
 
-func TestStdinOutput(t *testing.T) {
+func TestDevNullOutput(t *testing.T) {
 	temp := func(suffix string) (string, error) { return "/tmpdir/out" + suffix, nil }
 	cases := []struct {
 		name     string
@@ -234,7 +234,7 @@ func TestStdinOutput(t *testing.T) {
 			[]string{"-x", "c", "-c", "-"}},
 		{"not stdin",
 			[]string{"-c", "a.c", "-o", "/dev/null"},
-			[]string{"-c", "a.c", "-o", "/dev/null"}},
+			[]string{"-c", "a.c", "-o", "/tmpdir/out.o"}},
 		{"stdin to a real output",
 			[]string{"-x", "c", "-c", "-", "-o", "b.o"},
 			[]string{"-x", "c", "-c", "-", "-o", "b.o"}},
@@ -242,12 +242,15 @@ func TestStdinOutput(t *testing.T) {
 			[]string{"-E", "a.c", "-o", "-"},
 			[]string{"-E", "a.c", "-o", "-"}},
 		{"- as a flag's value is not stdin",
-			[]string{"-c", "a.c", "-MF", "-", "-o", "/dev/null"},
-			[]string{"-c", "a.c", "-MF", "-", "-o", "/dev/null"}},
+			[]string{"-###", "-c", "a.c", "-MF", "-"},
+			[]string{"-###", "-c", "a.c", "-MF", "-"}},
+		{"/dev/null as a flag's value is not the output",
+			[]string{"-c", "a.c", "-MF", "/dev/null", "-o", "a.o"},
+			[]string{"-c", "a.c", "-MF", "/dev/null", "-o", "a.o"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := StdinOutput(c.in, temp)
+			got, err := DevNullOutput(c.in, temp)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -256,7 +259,7 @@ func TestStdinOutput(t *testing.T) {
 			}
 		})
 	}
-	if _, err := StdinOutput([]string{"-c", "-", "-o", "/dev/null"}, func(string) (string, error) {
+	if _, err := DevNullOutput([]string{"-c", "-", "-o", "/dev/null"}, func(string) (string, error) {
 		return "", errors.New("no space")
 	}); err == nil || !strings.Contains(err.Error(), "$TMPDIR") {
 		t.Errorf("a failed temp output is not reported: %v", err)
@@ -272,9 +275,106 @@ func TestRewriteStdinOnBothPlatforms(t *testing.T) {
 			t.Fatal(err)
 		}
 		tail := plan.Args[len(plan.Args)-2:]
-		if !reflect.DeepEqual(tail, []string{"-o", "/tmpdir/zig-cc-shim-stdin-1.o"}) {
+		if !reflect.DeepEqual(tail, []string{"-o", "/tmpdir/zig-cc-shim-out-1.o"}) {
 			t.Errorf("%v: %q", host, plan.Args)
 		}
+	}
+}
+
+// TestRewriteDevNullOutput is kottera W1-A2's finding (4): with zig 0.17.0,
+// `-o /dev/null` leaks <basename>.o into the working directory whatever the
+// input, not only for stdin.
+func TestRewriteDevNullOutput(t *testing.T) {
+	const tmp = "/tmpdir/zig-cc-shim-out-1"
+	cases := []struct {
+		name     string
+		in, want []string
+	}{
+		{"one source file",
+			[]string{"-c", "a.c", "-o", "/dev/null"},
+			[]string{"-c", "a.c", "-o", tmp + ".o"}},
+		{"several source files",
+			[]string{"-c", "a.c", "b.c", "-o", "/dev/null"},
+			[]string{"-c", "a.c", "b.c", "-o", tmp + ".o"}},
+		{"joined -o/dev/null",
+			[]string{"-Werror", "-c", "a.c", "-o/dev/null"},
+			[]string{"-Werror", "-c", "a.c", "-o", tmp + ".o"}},
+		{"assembly",
+			[]string{"-S", "a.c", "-o", "/dev/null"},
+			[]string{"-S", "a.c", "-o", tmp + ".s"}},
+		{"stdin, unchanged from W1-C2",
+			[]string{"-x", "c", "-c", "-", "-o", "/dev/null"},
+			[]string{"-x", "c", "-c", "-", "-o", tmp + ".o"}},
+		{"stdin under -###, unchanged from W1-C2",
+			[]string{"-###", "-x", "c", "-c", "-"},
+			[]string{"-###", "-x", "c", "-c", "-", "-o", tmp + ".o"}},
+		{"a real output is left alone",
+			[]string{"-c", "a.c", "-o", "a.o"},
+			[]string{"-c", "a.c", "-o", "a.o"}},
+	}
+	for _, host := range []Platform{linuxAmd, linuxArm, darwinArm, darwinAmd} {
+		for _, c := range cases {
+			t.Run(host.OS+"-"+host.Arch+"/"+c.name, func(t *testing.T) {
+				h := fakeHost(host, nil)
+				h.TempOutput = func(suffix string) (string, error) { return tmp + suffix, nil }
+				role, _ := ParseRole("cc")
+				plan, err := Rewrite(role, c.in, h)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(plan.Args) < len(c.want) || !reflect.DeepEqual(plan.Args[len(plan.Args)-len(c.want):], c.want) {
+					t.Errorf("got %q want suffix %q", plan.Args, c.want)
+				}
+			})
+		}
+	}
+}
+
+// TestRewriteMarch is kottera W1-A2's divergence row 21: zig 0.17.0 rejects
+// gcc's and clang's -march=x86-64-v3 ("unknown CPU: 'x86'") and accepts
+// x86_64_v3.
+func TestRewriteMarch(t *testing.T) {
+	cases := []struct {
+		host     Platform
+		role     string
+		in, want string
+	}{
+		{linuxAmd, "cc", "-march=x86-64", "-march=x86_64"},
+		{linuxAmd, "cc", "-march=x86-64-v2", "-march=x86_64_v2"},
+		{linuxAmd, "c++", "-march=x86-64-v3", "-march=x86_64_v3"},
+		{linuxAmd, "cc", "-march=x86-64-v4", "-march=x86_64_v4"},
+		{darwinAmd, "cc", "-march=x86-64-v3", "-march=x86_64_v3"},
+		{darwinArm, "x86_64-unknown-linux-gnu-cc", "-march=x86-64-v3", "-march=x86_64_v3"},
+		{linuxArm, "x86_64-apple-darwin-cc", "-march=x86-64-v2", "-march=x86_64_v2"},
+		// Any other value passes through.
+		{linuxAmd, "cc", "-march=haswell", "-march=haswell"},
+		{linuxAmd, "cc", "-march=native", "-march=native"},
+		{linuxAmd, "cc", "-march=x86-64-v5", "-march=x86-64-v5"},
+		{linuxAmd, "cc", "-march=x86_64_v3", "-march=x86_64_v3"},
+		// Nothing is rewritten for a target that is not x86_64.
+		{linuxArm, "cc", "-march=x86-64-v3", "-march=x86-64-v3"},
+		{linuxAmd, "aarch64-unknown-linux-gnu-cc", "-march=x86-64-v3", "-march=x86-64-v3"},
+		{darwinAmd, "aarch64-apple-darwin-cc", "-march=x86-64", "-march=x86-64"},
+		{linuxArm, "cc", "-march=armv8.2-a", "-march=armv8.2-a"},
+		// ar and ranlib are not compiles.
+		{linuxAmd, "ar", "-march=x86-64-v3", "-march=x86-64-v3"},
+	}
+	for _, c := range cases {
+		t.Run(c.host.OS+"-"+c.host.Arch+"/"+c.role+"/"+c.in, func(t *testing.T) {
+			role, err := ParseRole(c.role)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := []string{"-O2", c.in, "-c", "a.c", "-o", "a.o"}
+			plan, err := Rewrite(role, in, fakeHost(c.host, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"-O2", c.want, "-c", "a.c", "-o", "a.o"}
+			if len(plan.Args) < len(want) || !reflect.DeepEqual(plan.Args[len(plan.Args)-len(want):], want) {
+				t.Errorf("got %q want suffix %q", plan.Args, want)
+			}
+		})
 	}
 }
 
