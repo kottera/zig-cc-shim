@@ -157,3 +157,33 @@ export CC_TOOLCHAIN_TARGET_GLIBC=2.31 CC_TOOLCHAIN_TARGET_MACOS=13.0
 Then put `~/cc/bin` first on `PATH`, or point `CC`, `CXX`, `AR` or `CARGO_TARGET_<TRIPLE>_LINKER` at its entries.
 
 **The role entries are hard links to one binary.** Copies would put sixteen identical binaries in the store and the release. Symlinks would break the shim under any build tool that resolves its compiler with `realpath` before running it: `argv[0]` would then be the link target's name, not the role. A hard link has the role's own name however it is resolved, and it costs one binary's space. kottera's `pkg/archive` supports hard links, so the release's tar can carry them as they are. A symlink that someone else points at a role entry still works: the role comes from the symlink's own name, and zig is found through the resolved path.
+
+## The release
+
+A release is cut by pushing a tag matching **`v*`** (for example `v0.1.0`); nothing else publishes one. The tag workflow (`.github/workflows/release.yml`) builds the shim for darwin/arm64, darwin/amd64, linux/amd64 and linux/arm64 and publishes a GitHub release of this repository with these assets, where `<tag>` is the pushed tag:
+
+| Platform (`<os>/<arch>`) | Asset |
+|---|---|
+| `darwin/arm64` | `zig-cc-shim-<tag>-darwin-arm64.tar.gz` |
+| `darwin/amd64` | `zig-cc-shim-<tag>-darwin-amd64.tar.gz` |
+| `linux/amd64` | `zig-cc-shim-<tag>-linux-amd64.tar.gz` |
+| `linux/arm64` | `zig-cc-shim-<tag>-linux-arm64.tar.gz` |
+| all | `SHA256SUMS`, in `sha256sum`'s format (`<hex>  <asset>`) |
+
+So a toolchain definition keys each `url` and `sha256` by `<os>/<arch>`, and takes each `sha256` from the release's `SHA256SUMS` (kottera ADR-155 D7).
+
+Each tarball is shaped for kottera's `pkg/archive`, unpacked with `dest = "cc"` and `strip_components = 0`. It holds the directory `bin/`, the shim as `bin/<first role>`, and every other role as a hard link to it, all with mode 0755. There are no absolute names, no `..`, no symlinks, and no other files. Unpacked beside `cc/zig/`, `cc/bin/<role>` runs and finds `cc/zig/zig`. `internal/release`'s tests check this against the real shim build, and every release build checks each tarball before it writes it.
+
+**Two builds of one commit are the same bytes.** The build pins everything that would otherwise vary:
+
+- the Go build: `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=true` (the commit is stamped, which `--tera-describe` reports), and `-ldflags=-buildid=`. `GOFLAGS` and `GOEXPERIMENT` are cleared, `GOAMD64=v1` and `GOARM64=v8.0` are pinned, and `GOTOOLCHAIN=local` stops Go from fetching another toolchain. The Go version is the one `go.mod` names, which CI installs;
+- the tar: USTAR, in a fixed entry order, with owner and group 0 and no names. Every entry's mtime is the commit's time;
+- the gzip: no name, no time, best compression.
+
+A build of a checkout with uncommitted changes is refused, because its digests would describe no commit. The same check CI runs is one command:
+
+```
+go run ./cmd/release build -check -out dist
+```
+
+It builds the whole release, then builds it again with an empty build cache, and fails if any byte differs. It writes the release into `dist/`, which git ignores. Add `-allow-modified` to try it on uncommitted work. On a tag, a pull request or a manual run, CI runs this on both self-hosted runners and then `go run ./cmd/release compare <macOS build> <Linux build>`, which fails unless both hosts built identical bytes. Only a pushed tag goes on to `go run ./cmd/release publish`, which creates the release as a draft, uploads every asset, then publishes it. It never replaces an existing release.

@@ -1,0 +1,96 @@
+# The shim's release (kottera ADR-155 D3): one gzip tar per platform whose
+# entries are bin/<role>, plus a SHA256SUMS, published as a GitHub release
+# of this repository when a v* tag is pushed. Every step is a Go command:
+# `go run ./cmd/release`.
+#
+# Each runner builds the whole release twice, the second time with an empty
+# build cache, and fails if a byte differs. The compare job then fails unless
+# the macOS and the Linux runner built identical bytes too. On a pull
+# request or a manual run, that is where it stops: only a pushed v* tag
+# publishes, and only after both checks.
+#
+# Self-hosted runners only. The organisation's hosted-runner billing is
+# blocked, so a hosted job is never started and shows red (kottera/kottera
+# docs/ops/ci.md). These labels are the two runners registered to this
+# repository.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: macos-arm64
+            runner: [self-hosted, macOS, ARM64]
+          - host: linux-x64
+            runner: [self-hosted, Linux, X64]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history and its tags: Go stamps the module version from
+          # them, and a tag build's version is the tag.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # No go.sum, and the second build must not be served from a cache.
+          cache: false
+      - run: go run ./cmd/release build -check -out ${{ runner.temp }}/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.host }}
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 7
+
+  compare:
+    needs: build
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/builds
+      - run: go run ./cmd/release compare ${{ runner.temp }}/builds/release-macos-arm64 ${{ runner.temp }}/builds/release-linux-x64
+
+  publish:
+    needs: compare
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-macos-arm64
+          path: ${{ runner.temp }}/release
+      - run: go run ./cmd/release publish -tag "$GITHUB_REF_NAME" ${{ runner.temp }}/release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
