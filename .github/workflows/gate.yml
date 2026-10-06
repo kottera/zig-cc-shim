@@ -1,0 +1,40 @@
+# The repository gate, on both platforms the shim runs on. It runs exactly
+# what a person runs locally: `go run ./cmd/gate`.
+#
+# Self-hosted runners only. The organisation's hosted-runner billing is
+# blocked, so a hosted job is never started and shows red (kottera/kottera
+# docs/ops/ci.md). These labels are the two runners registered to this
+# repository.
+name: gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - [self-hosted, macOS, ARM64]
+          - [self-hosted, Linux, X64]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # No go.sum: the module has no dependencies, so there is nothing
+          # for setup-go's module cache to key on.
+          cache: false
+      - run: go run ./cmd/gate
