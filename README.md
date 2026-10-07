@@ -104,6 +104,17 @@ The shim has already become zig by then, so it cannot remove that file. It is sm
 
 gcc and clang spell the x86-64 levels `-march=x86-64`, `-march=x86-64-v2`, `-march=x86-64-v3` and `-march=x86-64-v4`, and the Rust `cc` crate passes `-march=<target-cpu>` in that spelling. zig 0.17.0 rejects it (`unknown CPU: 'x86'`) and wants `x86_64`, `x86_64_v2`, `x86_64_v3` and `x86_64_v4`. For an x86_64 target the shim translates those four values to zig's spelling. Any other `-march` value is passed through untouched. Nothing is rewritten for an aarch64 target.
 
+## A caller's --target
+
+The Rust `cc` crate passes `--target=<triple>` to every compile, in LLVM's spelling, and zig 0.17.0 rejects that spelling. kottera's bare-host measurements found it with both crates they built: W1-A3 on x86_64 Linux (`--target=x86_64-unknown-linux-gnu`: `unable to parse target query … UnknownOperatingSystem`) and W1-A4 on macOS arm64 (`--target=arm64-apple-macosx`: `unknown architecture: 'arm64'`).
+
+The shim already supplies the target, so a caller's target can only restate it or contradict it. For a compile role the shim reads every `--target=T`, `--target T` and `-target T`:
+
+- If T names the role's own architecture and OS, the shim drops it, and zig sees only the shim's `-target`. Architectures are read in any of `x86_64`/`amd64` and `aarch64`/`arm64`; the OS as `linux` or as `darwin`, `macos` or `macosx`, with or without a vendor (`unknown`, `pc`, `apple`), and with or without a version (`arm64-apple-macosx13.0`, `x86_64-linux-gnu.2.17`). A Linux T may name the `gnu` ABI. A version in T is dropped with it: the glibc floor and the macOS minimum come only from `CC_TOOLCHAIN_TARGET_GLIBC` and `CC_TOOLCHAIN_TARGET_MACOS`.
+- If T names another architecture, OS or ABI (`aarch64-unknown-linux-gnu` to an x86_64 role, `arm64-apple-ios`, `x86_64-unknown-linux-musl`, `arm64e-apple-macosx`), or is not a triple the shim can read, the shim refuses. The refusal names T, the role's target and, when one exists, the `<triple>-cc` or `<triple>-c++` role that builds T. The shim never builds for its own target when the caller asked for another, and never lets the caller's target replace its own.
+
+A `--target` that is another flag's value (`-Xclang --target=…`) is left alone. `-mmacosx-version-min` is passed through: W1-A4 found zig accepts it and the shim's minimum still wins.
+
 ## The glibc floor on Linux
 
 On a Linux host building for a Linux target, the shim checks the host's glibc against `CC_TOOLCHAIN_TARGET_GLIBC` before it runs zig. It reads the version banner (`… release version 2.39`) from the dynamic loader at the path the architecture's ABI fixes (`/lib64/ld-linux-x86-64.so.2`, `/lib/ld-linux-aarch64.so.1`). If that file has no banner, it reads `libc.so.6` in the usual distro locations. These files are read, never passed to the compiler. Below the floor, or when no glibc can be found (a musl host), the shim refuses. The refusal names the host's glibc, where it was read, the floor and the repair.

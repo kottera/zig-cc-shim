@@ -480,3 +480,145 @@ func TestRoleNames(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+// sameTargetTriples is every spelling of each role's own target that the
+// Rust cc crate (or clang, or zig) passes as --target: kottera W1-A3 saw
+// --target=x86_64-unknown-linux-gnu, and W1-A4 --target=arm64-apple-macosx,
+// both rejected by zig 0.17.0. The version a triple carries is never the
+// target's: the floor and the minimum come from CC_TOOLCHAIN_TARGET_*.
+var sameTargetTriples = map[Platform][]string{
+	linuxAmd: {"x86_64-unknown-linux-gnu", "x86_64-pc-linux-gnu", "x86_64-linux-gnu",
+		"x86_64-linux-gnu.2.17", "x86_64-unknown-linux"},
+	linuxArm: {"aarch64-unknown-linux-gnu", "aarch64-linux-gnu", "arm64-unknown-linux-gnu",
+		"aarch64-linux-gnu.2.35"},
+	darwinAmd: {"x86_64-apple-darwin", "x86_64-apple-macosx", "x86_64-apple-macosx13.0",
+		"x86_64-apple-macosx26.4", "x86_64-apple-darwin23.1.0", "x86_64-macos", "x86_64-macos.14.0"},
+	darwinArm: {"aarch64-apple-darwin", "arm64-apple-macosx", "arm64-apple-macosx13.0",
+		"arm64-apple-macosx26.4", "arm64-apple-darwin", "aarch64-apple-darwin24.0.0",
+		"aarch64-macos", "aarch64-macos.15.0"},
+}
+
+// TestRewriteCallerTargetSame is kottera W1-A3 and W1-A4: a caller's
+// --target that restates the role's own target is dropped, in each of its
+// three forms, so zig sees only the shim's -target.
+func TestRewriteCallerTargetSame(t *testing.T) {
+	type roleOn struct {
+		host Platform
+		role string
+		// target is the platform the role targets.
+		target Platform
+	}
+	var roles []roleOn
+	for _, host := range []Platform{linuxAmd, linuxArm, darwinArm, darwinAmd} {
+		roles = append(roles, roleOn{host, "cc", host}, roleOn{host, "c++", host})
+		for triple, p := range Triples {
+			roles = append(roles, roleOn{host, triple + "-cc", p}, roleOn{host, triple + "-c++", p})
+		}
+	}
+	for _, r := range roles {
+		for _, triple := range sameTargetTriples[r.target] {
+			for _, form := range [][]string{{"--target=" + triple}, {"--target", triple}, {"-target", triple}} {
+				name := r.host.OS + "-" + r.host.Arch + "/" + r.role + "/" + strings.Join(form, " ")
+				t.Run(name, func(t *testing.T) {
+					role, err := ParseRole(r.role)
+					if err != nil {
+						t.Fatal(err)
+					}
+					in := append(append([]string{"-O2"}, form...), "-c", "a.c", "-o", "a.o")
+					plan, err := Rewrite(role, in, fakeHost(r.host, nil))
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := []string{"-O2", "-c", "a.c", "-o", "a.o"}
+					if len(plan.Args) < len(want) || !reflect.DeepEqual(plan.Args[len(plan.Args)-len(want):], want) {
+						t.Errorf("got %q want suffix %q", plan.Args, want)
+					}
+					for i, a := range plan.Args {
+						if a == "-target" && i != 1 || strings.HasPrefix(a, "--target") {
+							t.Errorf("a caller's target reaches zig: %q", plan.Args)
+						}
+					}
+					floor := "linux-gnu.2.31"
+					if r.target.OS == "darwin" {
+						floor = "macos.13.0"
+					}
+					if !strings.HasSuffix(plan.Target, floor) || plan.Args[2] != plan.Target {
+						t.Errorf("target %q args %q: not the shim's own at %s", plan.Target, plan.Args, floor)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestRewriteCallerTargetDifferent: a --target naming another architecture,
+// OS or ABI is refused, never silently overridden, and the refusal names
+// both targets and the role that builds the caller's.
+func TestRewriteCallerTargetDifferent(t *testing.T) {
+	cases := []struct {
+		host   Platform
+		role   string
+		arg    []string
+		useTo  string // the role the refusal names, or "" when none fits
+		reason string
+	}{
+		{linuxAmd, "cc", []string{"--target=aarch64-unknown-linux-gnu"}, "aarch64-unknown-linux-gnu-cc", "architecture"},
+		{linuxAmd, "c++", []string{"--target", "aarch64-unknown-linux-gnu"}, "aarch64-unknown-linux-gnu-c++", "architecture"},
+		{darwinArm, "cc", []string{"--target=x86_64-apple-macosx"}, "x86_64-apple-darwin-cc", "architecture"},
+		{darwinArm, "cc", []string{"-target", "aarch64-unknown-linux-gnu"}, "aarch64-unknown-linux-gnu-cc", "OS"},
+		{linuxAmd, "x86_64-unknown-linux-gnu-cc", []string{"--target=x86_64-apple-darwin"}, "x86_64-apple-darwin-cc", "OS"},
+		{darwinArm, "aarch64-apple-darwin-c++", []string{"--target=arm64-apple-ios"}, "", "OS"},
+		{linuxAmd, "cc", []string{"--target=x86_64-unknown-linux-musl"}, "", "ABI"},
+		{linuxAmd, "cc", []string{"--target=i686-unknown-linux-gnu"}, "", "architecture"},
+		{darwinArm, "cc", []string{"--target=arm64e-apple-macosx"}, "", "architecture"},
+		{linuxAmd, "cc", []string{"--target=x86_64-pc-windows-msvc"}, "", "OS"},
+		{linuxAmd, "cc", []string{"--target="}, "", "not a triple"},
+		// Every --target is checked, not only the first.
+		{linuxAmd, "cc", []string{"--target=x86_64-unknown-linux-gnu", "-target", "aarch64-linux-gnu"}, "aarch64-unknown-linux-gnu-cc", "architecture"},
+	}
+	for _, c := range cases {
+		t.Run(c.host.OS+"-"+c.host.Arch+"/"+c.role+"/"+strings.Join(c.arg, " "), func(t *testing.T) {
+			role, _ := ParseRole(c.role)
+			in := append(append([]string{}, c.arg...), "-c", "a.c")
+			_, err := Rewrite(role, in, fakeHost(c.host, nil))
+			var r *Refusal
+			if !errors.As(err, &r) {
+				t.Fatalf("not refused: %v", err)
+			}
+			msg := r.Error()
+			callerTarget := c.arg[len(c.arg)-1]
+			callerTarget = strings.TrimPrefix(callerTarget, "--target=")
+			_, own, _ := Target(role, c.host, fakeHost(c.host, nil).Getenv)
+			for _, want := range []string{"zig-cc-shim (" + c.role + ")", callerTarget, own, c.reason, "repair:"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("refusal lacks %q:\n%s", want, msg)
+				}
+			}
+			if c.useTo != "" && !strings.Contains(r.Repair, "invoke "+c.useTo) {
+				t.Errorf("refusal does not name the role %s:\n%s", c.useTo, msg)
+			}
+			if c.useTo == "" && !strings.Contains(r.Repair, "no role") {
+				t.Errorf("refusal suggests a role for a target none builds:\n%s", msg)
+			}
+		})
+	}
+}
+
+// TestRewriteCallerTargetValues: a --target that is another flag's value is
+// not the caller's target, and ar and ranlib are left alone.
+func TestRewriteCallerTargetValues(t *testing.T) {
+	role, _ := ParseRole("cc")
+	in := []string{"-Xclang", "--target=aarch64-unknown-linux-gnu", "-c", "a.c"}
+	plan, err := Rewrite(role, in, fakeHost(linuxAmd, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.Args[len(plan.Args)-len(in):]; !reflect.DeepEqual(got, in) {
+		t.Errorf("got %q want suffix %q", plan.Args, in)
+	}
+	ar, _ := ParseRole("ar")
+	in = []string{"--target=aarch64-unknown-linux-gnu", "rcs", "x.a"}
+	if plan, err := Rewrite(ar, in, fakeHost(linuxAmd, nil)); err != nil || !reflect.DeepEqual(plan.Args[1:], in) {
+		t.Errorf("ar: %q %v", plan.Args, err)
+	}
+}

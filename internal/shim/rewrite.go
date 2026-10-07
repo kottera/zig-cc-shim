@@ -2,6 +2,7 @@ package shim
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -33,8 +34,9 @@ type Plan struct {
 
 // Rewrite turns one invocation of a role into zig's command line.
 //
-// For a compile role it supplies -target from the environment, checks the
-// glibc floor on a Linux host building for Linux, and for a darwin target
+// For a compile role it supplies -target from the environment, drops a
+// caller's --target that restates it (and refuses one that does not), checks
+// the glibc floor on a Linux host building for Linux, and for a darwin target
 // adds the SDK flags and de-duplicates -framework X and -lX. For an x86_64
 // target it respells gcc's -march=x86-64[-vN] as zig's. On every platform, a
 // compile to /dev/null is given an output under $TMPDIR. Nothing else is
@@ -46,6 +48,10 @@ func Rewrite(role Role, args []string, h Host) (Plan, error) {
 		return Plan{Args: append([]string{string(role.Driver)}, args...)}, nil
 	}
 	target, triple, err := Target(role, h.Platform, h.Getenv)
+	if err != nil {
+		return Plan{}, err
+	}
+	args, err = CallerTarget(role, target, triple, args)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -88,6 +94,126 @@ var takesValue = map[string]bool{
 	"-Xlinker": true, "-Xclang": true, "-Xassembler": true, "-Xpreprocessor": true,
 	"-weak_framework": true, "-install_name": true, "-rpath": true,
 	"-z": true, "-T": true, "-e": true, "-u": true,
+}
+
+// CallerTarget drops every --target=T, --target T and -target T from args
+// when T names the same architecture and OS as target, the role's own. The
+// Rust cc crate always passes one, in LLVM's spelling, which zig 0.17.0
+// rejects: kottera W1-A3 measured --target=x86_64-unknown-linux-gnu
+// ("UnknownOperatingSystem") and W1-A4 --target=arm64-apple-macosx
+// ("unknown architecture: 'arm64'"). The shim's own -target already says the
+// same thing, so the caller's only restates it. A version in T (macosx13.0,
+// linux-gnu.2.17) is dropped with it: the glibc floor and the macOS minimum
+// come only from CC_TOOLCHAIN_TARGET_*.
+//
+// A T that names another architecture, OS or ABI, or that is not a triple
+// the shim can read, is refused rather than dropped, naming both targets
+// and the role that builds T if there is one. Building for the role's target
+// when the caller asked for another would be silent, and so would passing T
+// on to override the role's.
+func CallerTarget(role Role, target Platform, triple string, args []string) ([]string, error) {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		var t string
+		switch {
+		case strings.HasPrefix(a, "--target="):
+			t = strings.TrimPrefix(a, "--target=")
+		case (a == "--target" || a == "-target") && i+1 < len(args):
+			i++
+			t = args[i]
+		case takesValue[a] && i+1 < len(args):
+			out = append(out, a, args[i+1])
+			i++
+			continue
+		default:
+			out = append(out, a)
+			continue
+		}
+		if err := checkCallerTarget(role, target, triple, t); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// tripleArch is the architecture spellings of LLVM, Rust, Apple and zig.
+var tripleArch = map[string]string{
+	"x86_64": "amd64", "amd64": "amd64",
+	"aarch64": "arm64", "arm64": "arm64",
+}
+
+// tripleVendor is the vendors a triple may name between its architecture
+// and its OS.
+var tripleVendor = map[string]bool{"unknown": true, "pc": true, "apple": true}
+
+// tripleOS is the OS spellings of LLVM, Rust, Apple and zig, with any
+// version stripped.
+var tripleOS = map[string]string{
+	"linux": "linux", "darwin": "darwin", "macos": "darwin", "macosx": "darwin",
+}
+
+// parseTriple reads arch-[vendor-]os[-abi], where os and abi may carry a
+// version (macosx13.0, darwin23.1.0, macos.13.0, gnu.2.31). It returns ""
+// when t names want, and otherwise the first component that differs from
+// want's or that it cannot read: "architecture", "OS" or "ABI".
+func parseTriple(t string, want Platform) (differs string) {
+	parts := strings.Split(t, "-")
+	arch, ok := tripleArch[parts[0]]
+	if !ok || arch != want.Arch {
+		return "architecture"
+	}
+	rest := parts[1:]
+	if len(rest) > 1 && tripleVendor[rest[0]] {
+		rest = rest[1:]
+	}
+	if len(rest) == 0 || len(rest) > 2 {
+		return "OS"
+	}
+	goos, ok := tripleOS[strings.TrimRight(rest[0], "0123456789.")]
+	if !ok || goos != want.OS {
+		return "OS"
+	}
+	abi := ""
+	if len(rest) == 2 {
+		abi = strings.TrimRight(rest[1], "0123456789.")
+	}
+	if abi != "" && !(goos == "linux" && abi == "gnu") {
+		return "ABI"
+	}
+	return ""
+}
+
+func checkCallerTarget(role Role, target Platform, triple, t string) error {
+	differs := parseTriple(t, target)
+	if differs == "" {
+		return nil
+	}
+	differs = "it names a different " + differs
+	if !strings.Contains(t, "-") {
+		differs = "it is not a triple the shim can read"
+	}
+	repair := "no role of the shim builds " + quote(t) + ": its roles target " + strings.Join(tripleNames(), ", ") + " only; build it with another toolchain, or drop the --target to build for " + triple
+	for name, p := range Triples {
+		if parseTriple(t, p) == "" {
+			repair = "invoke " + name + "-" + string(role.Driver) + " for " + quote(t) + " (for Cargo, name it in that target's CARGO_TARGET_<TRIPLE>_LINKER and CC_<triple>), or drop the --target to build for " + triple
+		}
+	}
+	return &Refusal{
+		Role:    role.Name,
+		Missing: fmt.Sprintf("a --target this role builds: the caller asked for %s, but %s targets %s, and %s", quote(t), role.Name, triple, differs),
+		Why:     "the shim takes its target only from the role and CC_TOOLCHAIN_TARGET_* (kottera ADR-155 D2, D3), so a caller's --target may restate that target but not change it; building for the role's target or for the caller's would each be silently building something the other did not ask for",
+		Repair:  repair,
+	}
+}
+
+func tripleNames() []string {
+	var names []string
+	for t := range Triples {
+		names = append(names, t)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // DedupDarwin drops every repeat of -framework X and of -lX (or -l X),
