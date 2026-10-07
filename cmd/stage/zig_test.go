@@ -188,11 +188,24 @@ func TestZigEndToEnd(t *testing.T) {
 		if got["target"] != target {
 			t.Errorf("target: %q, want %q", got["target"], target)
 		}
-		if got["zig"] != store.zig {
-			t.Errorf("zig: %q, want %q", got["zig"], store.zig)
+		// The shim reports the zig it resolved through symlinks, and the
+		// store may sit under one ($TMPDIR is under /var -> /private/var on
+		// darwin), so both sides are compared resolved.
+		if gotZig, wantZig := resolved(t, got["zig"]), resolved(t, store.zig); gotZig != wantZig {
+			t.Errorf("zig: %q (resolved %q), want %q (resolved %q)", got["zig"], gotZig, store.zig, wantZig)
 		}
 		t.Logf("MEASURE zig-version %s, target %s, sdk %q", got["zig-version"], got["target"], got["sdk"])
 	})
+}
+
+// resolved is path with every symlink resolved, or the test fails.
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolving %q: %v", path, err)
+	}
+	return real
 }
 
 // describe runs `<role> --tera-describe` and returns its keys.
@@ -317,13 +330,13 @@ func main() {
 	sum := 0
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
 			v := int(C.add(C.int(10), C.int(i)))
 			mu.Lock()
 			sum += v
 			mu.Unlock()
-		}()
+		}(i)
 	}
 	wg.Wait()
 	fmt.Println("cgo says", sum)
