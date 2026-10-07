@@ -1,7 +1,6 @@
 package shim
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -116,8 +115,7 @@ func RealHost() Host {
 		ReadFile: os.ReadFile,
 		SDK: SDKProbe{
 			Getenv: os.Getenv,
-			IsDir:  isDir,
-			Xcrun:  xcrun,
+			Dir:    statDir,
 		},
 		TempOutput: func(suffix string) (string, error) {
 			f, err := os.CreateTemp("", "zig-cc-shim-out-*"+suffix)
@@ -127,18 +125,6 @@ func RealHost() Host {
 			return f.Name(), f.Close()
 		},
 	}
-}
-
-func xcrun() (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	var out bytes.Buffer
-	cmd := exec.CommandContext(ctx, "/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path")
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out.String()), nil
 }
 
 func shimVersion() (version, revision string) {
@@ -159,11 +145,6 @@ func shimVersion() (version, revision string) {
 		}
 	}
 	return
-}
-
-func isDir(p string) bool {
-	fi, err := os.Stat(p)
-	return err == nil && fi.IsDir()
 }
 
 func isFile(p string) bool {

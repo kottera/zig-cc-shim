@@ -74,13 +74,18 @@ Nothing else is added on Linux. The shim never passes a host search path (`/usr/
 
 ## On darwin
 
-The macOS SDK is the one host input. It is taken from, in order:
+The macOS SDK is the one host input. The shim finds it by reading the filesystem only, and runs no `xcrun`: under a sandbox that grants the SDKs directory and nothing else, `xcrun` cannot run (kottera's W1-A4 measured this on a host whose only SDK was inside Xcode.app; PLAN-2026-10 R1). It is taken from, in order:
 
-1. `SDKROOT`, if set. If it is set and is not a directory, the shim refuses rather than falling past it;
-2. `/usr/bin/xcrun --sdk macosx --show-sdk-path`;
-3. `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`.
+1. `SDKROOT`, if set. If it is set and is not a readable directory, the shim refuses rather than falling past it;
+2. `DEVELOPER_DIR`, if set: the SDK inside the developer directory it selects, `<dir>/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk` for an Xcode or `<dir>/SDKs/MacOSX.sdk` for the Command Line Tools. An `Xcode.app` itself is accepted too, as `xcode-select` accepts it. If that directory has no SDK, the shim refuses. It never uses an SDK from a different developer directory than the one `DEVELOPER_DIR` selects;
+3. `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk`;
+4. `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk`.
 
-If none gives an SDK, the shim refuses and names `xcode-select --install` as the repair.
+When both the Command Line Tools and Xcode.app are installed and neither variable is set, the Command Line Tools' SDK wins. That is the SDK a sandboxed build already got before this order existed (`xcrun` failed and the shim fell back to it), so no host that worked changes SDK. Xcode.app is the place to look on a host that has nothing else. An Xcode installed anywhere else is selected with `DEVELOPER_DIR`.
+
+In steps 3 and 4 the first SDK that is present decides. If it is present but cannot be read (a sandbox's `EPERM`), the shim refuses rather than taking the next one, so a sandbox's grants never change which SDK a host builds with.
+
+Each refusal names the repair for that host: grant read access to the SDK that is present, fix or unset `SDKROOT` (naming the SDK the shim would otherwise take), or point `DEVELOPER_DIR` at a developer directory with an SDK. `xcode-select --install` is named only when the host has no SDK at all.
 
 For a darwin target the shim adds ADR-155 D3 item 3's measured set, verbatim:
 

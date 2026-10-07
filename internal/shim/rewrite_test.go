@@ -2,6 +2,7 @@ package shim
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"reflect"
 	"strings"
@@ -18,9 +19,9 @@ var (
 )
 
 // fakeHost is a host on platform p with the seeded floor and minimum set, an
-// SDK found by xcrun, and glibc 2.39 readable from the loader.
+// SDK named by SDKROOT, and glibc 2.39 readable from the loader.
 func fakeHost(p Platform, env map[string]string) Host {
-	vars := map[string]string{EnvGlibc: "2.31", EnvMacOS: "13.0"}
+	vars := map[string]string{EnvGlibc: "2.31", EnvMacOS: "13.0", "SDKROOT": fakeSDK}
 	for k, v := range env {
 		vars[k] = v
 	}
@@ -36,8 +37,12 @@ func fakeHost(p Platform, env map[string]string) Host {
 		},
 		SDK: SDKProbe{
 			Getenv: getenv,
-			IsDir:  func(d string) bool { return d == fakeSDK },
-			Xcrun:  func() (string, error) { return fakeSDK, nil },
+			Dir: func(d string) error {
+				if d == fakeSDK {
+					return nil
+				}
+				return fs.ErrNotExist
+			},
 		},
 		TempOutput: func(suffix string) (string, error) { return "/tmpdir/zig-cc-shim-out-1" + suffix, nil },
 	}

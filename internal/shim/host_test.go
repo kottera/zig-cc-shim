@@ -2,91 +2,162 @@ package shim
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
-func TestResolveSDKOrder(t *testing.T) {
-	const fromEnv, fromXcrun = "/env/SDK", "/xcrun/SDK"
+// fakeFS is an SDKProbe.Dir over a fake filesystem: dirs are directories,
+// denied are present but unreadable (a sandbox's EPERM), and anything else is
+// absent.
+func fakeFS(dirs, denied []string) func(string) error {
+	return func(p string) error {
+		for _, d := range denied {
+			if d == p {
+				return &fs.PathError{Op: "stat", Path: p, Err: syscall.EPERM}
+			}
+		}
+		for _, d := range dirs {
+			if d == p {
+				return nil
+			}
+		}
+		return &fs.PathError{Op: "stat", Path: p, Err: syscall.ENOENT}
+	}
+}
+
+func TestResolveSDK(t *testing.T) {
+	const (
+		fromEnv   = "/env/SDK"
+		otherApp  = "/Volumes/Tools/Xcode-26.6.app"
+		otherXc   = otherApp + "/Contents/Developer"
+		otherSDK  = otherXc + "/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+		emptyDev  = "/opt/empty-developer-dir"
+		cltViaDev = CommandLineToolsDeveloperDir
+	)
+	both := []string{CommandLineToolsSDK, XcodeSDK}
 	cases := []struct {
-		name    string
-		sdkroot string
-		xcrun   string
-		xErr    error
-		dirs    []string
-		want    string
+		name   string
+		env    map[string]string
+		dirs   []string
+		denied []string
+		want   string
+		// For a refusal: the text it must carry, and what it must not.
+		refusal []string
+		not     []string
 	}{
-		{"SDKROOT wins", fromEnv, fromXcrun, nil, []string{fromEnv, fromXcrun, CommandLineToolsSDK}, fromEnv},
-		{"then xcrun", "", fromXcrun, nil, []string{fromXcrun, CommandLineToolsSDK}, fromXcrun},
-		{"xcrun failing falls to CLT", "", "", errors.New("no developer dir"), []string{CommandLineToolsSDK}, CommandLineToolsSDK},
-		{"xcrun naming a missing dir falls to CLT", "", fromXcrun, nil, []string{CommandLineToolsSDK}, CommandLineToolsSDK},
-		{"xcrun printing nothing falls to CLT", "", "", nil, []string{CommandLineToolsSDK}, CommandLineToolsSDK},
+		{name: "SDKROOT set and valid wins over everything",
+			env: map[string]string{"SDKROOT": fromEnv, "DEVELOPER_DIR": XcodeDeveloperDir}, dirs: append([]string{fromEnv}, both...), want: fromEnv},
+		{name: "SDKROOT set and missing is refused, naming the SDK it would otherwise take",
+			env: map[string]string{"SDKROOT": "/gone/SDK"}, dirs: both,
+			refusal: []string{"/gone/SDK", "is not a directory", "unset SDKROOT, and the shim takes " + CommandLineToolsSDK},
+			not:     []string{"xcode-select --install"}},
+		{name: "SDKROOT set and missing on a host with no SDK",
+			env:     map[string]string{"SDKROOT": "/gone/SDK"},
+			refusal: []string{"/gone/SDK", "point SDKROOT at an installed SDK", "xcode-select --install"}},
+		{name: "SDKROOT set and missing, DEVELOPER_DIR naming no SDK",
+			env: map[string]string{"SDKROOT": "/gone/SDK", "DEVELOPER_DIR": emptyDev}, dirs: both,
+			refusal: []string{"/gone/SDK", "point SDKROOT at an installed SDK, or unset it"},
+			not:     []string{"xcode-select --install", "the shim takes"}},
+		{name: "SDKROOT set and unreadable is refused, naming the grant",
+			env: map[string]string{"SDKROOT": fromEnv}, dirs: both, denied: []string{fromEnv},
+			refusal: []string{fromEnv, "cannot be read", "grant this build read access to " + fromEnv},
+			not:     []string{"xcode-select --install"}},
+		{name: "DEVELOPER_DIR selecting Xcode, CLT present too",
+			env: map[string]string{"DEVELOPER_DIR": XcodeDeveloperDir}, dirs: both, want: XcodeSDK},
+		{name: "DEVELOPER_DIR selecting an Xcode.app bundle elsewhere",
+			env: map[string]string{"DEVELOPER_DIR": otherApp + "/"}, dirs: append([]string{otherSDK}, both...), want: otherSDK},
+		{name: "DEVELOPER_DIR selecting the Command Line Tools, Xcode present too",
+			env: map[string]string{"DEVELOPER_DIR": cltViaDev}, dirs: both, want: CommandLineToolsSDK},
+		{name: "DEVELOPER_DIR selecting a directory with no SDK never falls back",
+			env: map[string]string{"DEVELOPER_DIR": emptyDev}, dirs: both,
+			refusal: []string{"DEVELOPER_DIR", emptyDev, "set DEVELOPER_DIR to an Xcode", "or unset it"},
+			not:     []string{"xcode-select --install", CommandLineToolsSDK}},
+		{name: "DEVELOPER_DIR selecting an SDK it cannot read never falls back",
+			env: map[string]string{"DEVELOPER_DIR": XcodeDeveloperDir}, dirs: []string{CommandLineToolsSDK}, denied: []string{XcodeSDK},
+			refusal: []string{"grant this build read access to " + XcodeSDK},
+			not:     []string{"xcode-select --install"}},
+		{name: "Xcode only", dirs: []string{XcodeSDK}, want: XcodeSDK},
+		{name: "Xcode only, unreadable",
+			denied:  []string{XcodeSDK},
+			refusal: []string{XcodeSDK, "present but cannot be read", "grant this build read access to " + XcodeSDK},
+			not:     []string{"xcode-select --install"}},
+		{name: "CLT only", dirs: []string{CommandLineToolsSDK}, want: CommandLineToolsSDK},
+		{name: "both present, neither variable set: the Command Line Tools win", dirs: both, want: CommandLineToolsSDK},
+		{name: "both present, CLT unreadable: refused, not skipped to Xcode",
+			dirs: []string{XcodeSDK}, denied: []string{CommandLineToolsSDK},
+			refusal: []string{"grant this build read access to " + CommandLineToolsSDK},
+			not:     []string{"xcode-select --install"}},
+		{name: "nothing",
+			refusal: []string{"xcode-select --install", CommandLineToolsSDK, XcodeSDK, "SDKROOT and DEVELOPER_DIR are unset", "set DEVELOPER_DIR"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			xcrunCalled := false
 			got, err := ResolveSDK("cc", SDKProbe{
-				Getenv: func(k string) string {
-					if k == "SDKROOT" {
-						return c.sdkroot
-					}
-					return ""
-				},
-				IsDir: func(d string) bool {
-					for _, x := range c.dirs {
-						if x == d {
-							return true
-						}
-					}
-					return false
-				},
-				Xcrun: func() (string, error) { xcrunCalled = true; return c.xcrun, c.xErr },
+				Getenv: func(k string) string { return c.env[k] },
+				Dir:    fakeFS(c.dirs, c.denied),
 			})
-			if err != nil || got != c.want {
-				t.Fatalf("got %q, %v; want %q", got, err, c.want)
+			if c.refusal == nil {
+				if err != nil || got != c.want {
+					t.Fatalf("got %q, %v; want %q", got, err, c.want)
+				}
+				return
 			}
-			if c.sdkroot != "" && xcrunCalled {
-				t.Error("xcrun ran although SDKROOT was set")
+			var r *Refusal
+			if !errors.As(err, &r) {
+				t.Fatalf("got %q, %v; want a refusal", got, err)
+			}
+			for _, want := range c.refusal {
+				if !strings.Contains(r.Error(), want) {
+					t.Errorf("refusal lacks %q:\n%s", want, r)
+				}
+			}
+			for _, not := range c.not {
+				if strings.Contains(r.Repair, not) {
+					t.Errorf("repair names %q:\n%s", not, r)
+				}
 			}
 		})
 	}
 }
 
-func TestResolveSDKRefusals(t *testing.T) {
-	none := SDKProbe{
-		Getenv: func(string) string { return "" },
-		IsDir:  func(string) bool { return false },
-		Xcrun:  func() (string, error) { return "", errors.New("xcrun: error: invalid active developer path") },
+// Resolution reads the filesystem only (kottera PLAN-2026-10 R1): xcrun
+// cannot run under a sandbox that grants just the SDKs directory.
+func TestResolveSDKRunsNoSubprocess(t *testing.T) {
+	src, err := os.ReadFile("sdk.go")
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, err := ResolveSDK("cc", none)
-	var r *Refusal
-	if !errors.As(err, &r) {
-		t.Fatalf("not refused: %v", err)
-	}
-	for _, want := range []string{"xcode-select --install", CommandLineToolsSDK, "SDKROOT is unset"} {
-		if !strings.Contains(r.Error(), want) {
-			t.Errorf("refusal lacks %q:\n%s", want, r)
+	for _, banned := range []string{`"os/exec"`, "StartProcess", "ForkExec", "syscall.Exec"} {
+		if strings.Contains(string(src), banned) {
+			t.Errorf("sdk.go mentions %s", banned)
 		}
 	}
-	// A set SDKROOT that is not a directory is refused, not skipped.
-	badRoot := none
-	badRoot.Getenv = func(k string) string {
-		if k == "SDKROOT" {
-			return "/gone/SDK"
-		}
-		return ""
+}
+
+func TestStatDir(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "f")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	badRoot.IsDir = func(d string) bool { return d == CommandLineToolsSDK }
-	if _, err := ResolveSDK("cc", badRoot); err == nil || !strings.Contains(err.Error(), "/gone/SDK") {
-		t.Errorf("a missing SDKROOT fell through: %v", err)
+	if err := statDir(dir); err != nil {
+		t.Errorf("a directory: %v", err)
+	}
+	for _, p := range []string{filepath.Join(dir, "missing"), file, filepath.Join(file, "below")} {
+		if err := statDir(p); err == nil || !absent(err) {
+			t.Errorf("%s: got %v, want absent", p, err)
+		}
 	}
 }
 
 func TestRewriteDarwinWithoutSDK(t *testing.T) {
 	h := fakeHost(darwinArm, nil)
-	h.SDK.IsDir = func(string) bool { return false }
+	h.SDK.Getenv = func(string) string { return "" }
+	h.SDK.Dir = fakeFS(nil, nil)
 	role, _ := ParseRole("cc")
 	if _, err := Rewrite(role, []string{"-c", "a.c"}, h); err == nil || !strings.Contains(err.Error(), "xcode-select --install") {
 		t.Errorf("got %v", err)
