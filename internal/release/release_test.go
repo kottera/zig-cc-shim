@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"io"
@@ -40,6 +41,7 @@ func TestTarballRunsWhereKotteraUnpacksIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	requireTrimmed(t, bin, built)
 	var tgz bytes.Buffer
 	if err := Tarball(&tgz, built, shim.RoleNames(), mtime); err != nil {
 		t.Fatal(err)
@@ -94,6 +96,36 @@ func TestTarballRunsWhereKotteraUnpacksIt(t *testing.T) {
 		if !strings.Contains(string(out), "role: "+role+"\n") || !strings.Contains(string(out), "zig: "+resolvedZig+"\n") {
 			t.Errorf("%s %s did not run as %s with %s:\n%s", role, shim.DescribeFlag, role, resolvedZig, out)
 		}
+	}
+}
+
+// requireTrimmed fails unless the release binary was built with -trimpath:
+// its build info records the flag, and its bytes do not name the checkout it
+// was built in. Without -trimpath the binary carries the checkout's absolute
+// path, so builds from two checkouts differ and the release does not
+// reproduce; a -check that builds twice in one checkout cannot notice that.
+func requireTrimmed(t *testing.T, bin string, built []byte) {
+	t.Helper()
+	if !slices.Contains(BuildFlags, "-trimpath") {
+		t.Errorf("BuildFlags %q lacks -trimpath", BuildFlags)
+	}
+	bi, err := buildinfo.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmed := false
+	for _, s := range bi.Settings {
+		trimmed = trimmed || (s.Key == "-trimpath" && s.Value == "true")
+	}
+	if !trimmed {
+		t.Errorf("the release binary's build info does not record -trimpath=true: %v", bi.Settings)
+	}
+	checkout, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(built, []byte(checkout)) {
+		t.Errorf("the release binary names the checkout %s", checkout)
 	}
 }
 

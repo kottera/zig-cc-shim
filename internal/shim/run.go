@@ -117,13 +117,12 @@ func RealHost() Host {
 			Getenv: os.Getenv,
 			Dir:    statDir,
 		},
-		TempOutput: func(suffix string) (string, error) {
-			f, err := os.CreateTemp("", "zig-cc-shim-out-*"+suffix)
-			if err != nil {
-				return "", err
-			}
-			return f.Name(), f.Close()
-		},
+		TempOutput: TempOutputs{
+			Dir:   os.TempDir(),
+			PID:   os.Getpid(),
+			Now:   time.Now,
+			Alive: pidAlive,
+		}.Create,
 		Getwd: func() (string, error) {
 			wd, err := os.Getwd()
 			if err != nil {

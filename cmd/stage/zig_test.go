@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kottera/zig-cc-shim/internal/barehost"
 	"github.com/kottera/zig-cc-shim/internal/shim"
@@ -198,6 +199,57 @@ func TestZigEndToEnd(t *testing.T) {
 	})
 }
 
+// TestZigDevNullOutputsBounded is W1-F2.a: the outputs the shim gives zig in
+// place of -o /dev/null do not pile up under $TMPDIR. zig writes each one and
+// exits, and the next compile to /dev/null removes those whose process has
+// exited once they are past shim.TempOutputGrace. The test runs several such
+// compiles, ages their outputs past the grace period, and runs one more,
+// which must leave its own output alone; the working directory holds only
+// the source throughout.
+func TestZigDevNullOutputsBounded(t *testing.T) {
+	store := requireZigStore(t)
+	tmp, dir := t.TempDir(), t.TempDir()
+	env := []string{"TMPDIR=" + tmp}
+	writeFile(t, dir, "a.c", "int a;\n")
+	outputs := func() []string {
+		t.Helper()
+		matches, err := filepath.Glob(filepath.Join(tmp, shim.TempOutputPrefix+"*"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return matches
+	}
+	compile := func() {
+		t.Helper()
+		command(t, dir, env, "", store.role("cc"), "-c", "a.c", "-o", "/dev/null")
+		command(t, dir, env, "int x;\n", store.role("cc"), "-Werror", "-x", "c", "-c", "-", "-o", "/dev/null")
+	}
+	const rounds = 3
+	for range rounds {
+		compile()
+	}
+	if got := outputs(); len(got) != 2*rounds {
+		t.Fatalf("%d compiles inside the grace period left %d outputs, want one each: %q", 2*rounds, len(got), got)
+	}
+	aged := time.Now().Add(-shim.TempOutputGrace - time.Minute)
+	for _, p := range outputs() {
+		if err := os.Chtimes(p, aged, aged); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command(t, dir, env, "", store.role("cc"), "-c", "a.c", "-o", "/dev/null")
+	got := outputs()
+	if len(got) != 1 {
+		t.Fatalf("a compile after %d aged outputs left %d: %q, want only its own", 2*rounds, len(got), got)
+	}
+	if fi, err := os.Stat(got[0]); err != nil || fi.Size() == 0 {
+		t.Errorf("zig did not write the output the shim named, %s: %v", got[0], err)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 1 {
+		t.Errorf("the compiles wrote into their working directory: %v %v", entries, err)
+	}
+}
+
 // resolved is path with every symlink resolved, or the test fails.
 func resolved(t *testing.T, path string) string {
 	t.Helper()
@@ -369,6 +421,36 @@ func TestZigCallerSearchDirsOnDarwin(t *testing.T) {
 			dir := t.TempDir()
 			writeFile(t, dir, "main.c", addMain)
 			command(t, dir, nil, "", store.role("cc"), append(append([]string{"main.c"}, flags...), "-ladd", "-o", "main")...)
+			run(t, dir)
+		})
+	}
+	// W1-F2.b: a build system that passes its arguments in an @file passes
+	// its -L there. zig reads the file itself and re-roots the -L in it.
+	t.Run("control: bare zig cc drops the absolute -L in an @file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "main.c", addMain)
+		writeFile(t, dir, "link.rsp", "-L"+lib+" -ladd\n")
+		args := append([]string{"cc", "-target", d["target"]}, shim.DarwinFlags(d["sdk"])...)
+		args = append(args, "main.c", "@link.rsp", "-o", "main")
+		cmd := exec.Command(store.zig, args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		t.Logf("MEASURE zig %s: %v\n%s", strings.Join(args, " "), err, out)
+		if err == nil {
+			t.Fatal("bare zig cc found libadd.a through an absolute -L in an @file under --sysroot, so the shim's " +
+				"rewriting is no longer what makes the shim's @file arms pass")
+		}
+	})
+	for _, c := range []struct{ name, rsp string }{
+		{"-L<dir>", "-L" + lib + " -ladd\n"},
+		{"a comment, a quoted -L <dir> and a repeated -l", "# the library\n-L '" + lib + "'\n-ladd -ladd\n"},
+	} {
+		rsp := c.rsp
+		t.Run("shim: cc links -ladd through an @file holding "+c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "main.c", addMain)
+			writeFile(t, dir, "link.rsp", rsp)
+			command(t, dir, nil, "", store.role("cc"), "main.c", "@link.rsp", "-o", "main")
 			run(t, dir)
 		})
 	}

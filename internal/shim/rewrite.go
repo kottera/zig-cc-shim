@@ -19,7 +19,8 @@ type Host struct {
 	SDK SDKProbe
 	// TempOutput returns a fresh path under $TMPDIR with the given suffix,
 	// for a compile to /dev/null whose output would otherwise land in the
-	// working directory.
+	// working directory. On the real host it is TempOutputs.Create, which
+	// also removes the outputs of compiles that are over.
 	TempOutput func(suffix string) (string, error)
 	// Getwd returns the working directory zig will run in, with every
 	// symlink resolved.
@@ -47,7 +48,8 @@ type Plan struct {
 // caller's --target that restates it (and refuses one that does not), checks
 // the glibc floor on a Linux host building for Linux, and for a darwin target
 // adds the SDK flags, keeps a caller's absolute -L and -F that name a
-// directory outside the SDK, and de-duplicates -framework X and -lX. For an x86_64
+// directory outside the SDK (given directly or in an @file), and
+// de-duplicates -framework X and -lX. For an x86_64
 // target it respells gcc's -march=x86-64[-vN] as zig's. On every platform, a
 // compile to /dev/null is given an output under $TMPDIR. Nothing else is
 // added: no host search path, and none of the rewrites of Uber's wrapper
@@ -276,6 +278,15 @@ func DedupDarwin(args []string) []string {
 // working directory, keeping the caller's form (kottera PLAN-2026-10-hermetic-
 // c-toolchain, ruling R2).
 //
+// A build system that passes its arguments in an @file response file passes
+// its -L and -F there too, and zig re-roots those the same way. The shim
+// leaves the @file argument and the file itself as the caller wrote them, and
+// adds the respelled form of each such -L and -F in the file right after the
+// @file argument, reading the file as zig does (ResponseFileArgs). That only
+// adds: zig still reads the file and still drops the re-rooted original, so
+// the kept directory is searched after the file's other directories rather
+// than among them.
+//
 // The new spelling is derived only from the caller's argument and the
 // working directory: the shim names no host path of its own (ADR-155 D4).
 // Everything else is returned unchanged and left to zig: a relative
@@ -283,50 +294,175 @@ func DedupDarwin(args []string) []string {
 // means <sdk>/usr/lib), and one that does not exist, which zig re-roots and
 // drops as before.
 func CallerSearchDirs(args []string, sdk string, h Host) ([]string, error) {
-	out := append([]string{}, args...)
-	var cwd string
-	for i := 0; i < len(out); i++ {
-		a := out[i]
-		flag, dir, joined := "", "", false
+	k := searchDirKeeper{sdk: sdk, h: h}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
-		case (a == "-L" || a == "-F") && i+1 < len(out):
-			flag, dir = a, out[i+1]
-		case strings.HasPrefix(a, "-L") || strings.HasPrefix(a, "-F"):
-			flag, dir, joined = a[:2], a[2:], true
-		case takesValue[a]:
+		case (a == "-L" || a == "-F") && i+1 < len(args):
 			i++
-			continue
-		default:
-			continue
-		}
-		if !joined {
-			i++
-		}
-		if !keepCallerDir(dir, sdk, h) {
-			continue
-		}
-		if cwd == "" {
-			wd, err := h.Getwd()
+			kept, err := k.respell(a, args[i], false)
 			if err != nil {
-				return nil, fmt.Errorf("zig-cc-shim: finding the working directory, to keep %s%s from being re-rooted under the SDK: %w", flag, dir, err)
+				return nil, err
 			}
-			cwd = wd
-		}
-		real, _ := h.EvalSymlinks(dir)
-		rel, err := filepath.Rel(cwd, real)
-		if err != nil {
-			return nil, fmt.Errorf("zig-cc-shim: spelling %s%s relative to %s: %w", flag, dir, cwd, err)
-		}
-		if strings.HasPrefix(rel, "-") {
-			rel = "./" + rel
-		}
-		if joined {
-			out[i] = flag + rel
-		} else {
-			out[i] = rel
+			if kept == nil {
+				kept = []string{a, args[i]}
+			}
+			out = append(out, kept...)
+		case strings.HasPrefix(a, "-L") || strings.HasPrefix(a, "-F"):
+			kept, err := k.respell(a[:2], a[2:], true)
+			if err != nil {
+				return nil, err
+			}
+			if kept == nil {
+				kept = []string{a}
+			}
+			out = append(out, kept...)
+		case strings.HasPrefix(a, "@") && len(a) > 1:
+			kept, err := k.responseFile(a[1:])
+			if err != nil {
+				return nil, err
+			}
+			out = append(append(out, a), kept...)
+		case takesValue[a] && i+1 < len(args):
+			out = append(out, a, args[i+1])
+			i++
+		default:
+			out = append(out, a)
 		}
 	}
 	return out, nil
+}
+
+// searchDirKeeper respells the directories CallerSearchDirs keeps. It asks
+// for the working directory only once there is one to keep.
+type searchDirKeeper struct {
+	sdk string
+	h   Host
+	cwd string
+}
+
+// respell returns flag and dir, joined or separate as the caller wrote them,
+// with dir relative to the working directory, or nil when zig is left to
+// handle dir.
+func (k *searchDirKeeper) respell(flag, dir string, joined bool) ([]string, error) {
+	if !keepCallerDir(dir, k.sdk, k.h) {
+		return nil, nil
+	}
+	if k.cwd == "" {
+		wd, err := k.h.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("zig-cc-shim: finding the working directory, to keep %s%s from being re-rooted under the SDK: %w", flag, dir, err)
+		}
+		k.cwd = wd
+	}
+	real, _ := k.h.EvalSymlinks(dir)
+	rel, err := filepath.Rel(k.cwd, real)
+	if err != nil {
+		return nil, fmt.Errorf("zig-cc-shim: spelling %s%s relative to %s: %w", flag, dir, k.cwd, err)
+	}
+	if strings.HasPrefix(rel, "-") {
+		rel = "./" + rel
+	}
+	if joined {
+		return []string{flag + rel}, nil
+	}
+	return []string{flag, rel}, nil
+}
+
+// responseFile returns the respelled form of every -L and -F in the response
+// file at path that respell keeps, in the file's order. A file the shim
+// cannot read adds nothing: zig reads it too, and reports it. An @file named
+// inside the file is not followed.
+func (k *searchDirKeeper) responseFile(path string) ([]string, error) {
+	content, err := k.h.ReadFile(path)
+	if err != nil {
+		return nil, nil
+	}
+	args := ResponseFileArgs(string(content))
+	var kept []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		var r []string
+		switch {
+		case (a == "-L" || a == "-F") && i+1 < len(args):
+			i++
+			r, err = k.respell(a, args[i], false)
+		case strings.HasPrefix(a, "-L") || strings.HasPrefix(a, "-F"):
+			r, err = k.respell(a[:2], a[2:], true)
+		case takesValue[a]:
+			i++
+		}
+		if err != nil {
+			return nil, err
+		}
+		kept = append(kept, r...)
+	}
+	return kept, nil
+}
+
+// ResponseFileArgs splits a response file into arguments the way zig 0.17.0
+// reads an @file on a `zig cc` command line: std.process.Args.IteratorGeneral
+// with comments and single quotes (lib/std/process/Args.zig). Arguments are
+// separated by spaces, tabs, carriage returns and newlines outside quotes. A
+// # where an argument would begin starts a comment that runs to the end of
+// the line. ' and " each open and close a quote, the one closing the other.
+// Backslashes are literal except before a quote: 2n backslashes and a quote
+// are n backslashes and the quote's effect, and 2n+1 backslashes and a quote
+// are n backslashes and a literal ".
+func ResponseFileArgs(s string) []string {
+	var args []string
+	i := 0
+	for {
+		// Skip whitespace and comments.
+		for i < len(s) {
+			switch s[i] {
+			case ' ', '\t', '\r', '\n':
+				i++
+				continue
+			case '#':
+				for i < len(s) && s[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			break
+		}
+		if i == len(s) {
+			return args
+		}
+		var arg strings.Builder
+		backslashes, inQuote := 0, false
+	token:
+		for ; i < len(s); i++ {
+			c := s[i]
+			switch c {
+			case '"', '\'':
+				arg.WriteString(strings.Repeat("\\", backslashes/2))
+				if backslashes%2 == 0 {
+					inQuote = !inQuote
+				} else {
+					arg.WriteByte('"')
+				}
+				backslashes = 0
+			case '\\':
+				backslashes++
+			case ' ', '\t', '\r', '\n':
+				arg.WriteString(strings.Repeat("\\", backslashes))
+				backslashes = 0
+				if !inQuote {
+					break token
+				}
+				arg.WriteByte(c)
+			default:
+				arg.WriteString(strings.Repeat("\\", backslashes))
+				backslashes = 0
+				arg.WriteByte(c)
+			}
+		}
+		arg.WriteString(strings.Repeat("\\", backslashes))
+		args = append(args, arg.String())
+	}
 }
 
 // keepCallerDir reports whether zig would lose dir under --sysroot sdk while

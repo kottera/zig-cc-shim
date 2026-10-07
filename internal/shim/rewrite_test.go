@@ -469,6 +469,13 @@ func TestRewriteTargetMalformed(t *testing.T) {
 			t.Errorf("%s=%q: %v", EnvGlibc, bad, err)
 		}
 	}
+	for _, bad := range []string{"13.0 -F/Library/Frameworks", "latest", "13.0.1.1", "13.", "v13"} {
+		role, _ := ParseRole("cc")
+		_, err := Rewrite(role, nil, fakeHost(darwinArm, map[string]string{EnvMacOS: bad}))
+		if err == nil || !strings.Contains(err.Error(), "is not a version") {
+			t.Errorf("%s=%q: %v", EnvMacOS, bad, err)
+		}
+	}
 	for _, good := range []string{"13", "13.0", "13.0.1"} {
 		role, _ := ParseRole("cc")
 		plan, err := Rewrite(role, nil, fakeHost(darwinArm, map[string]string{EnvMacOS: good}))
@@ -749,5 +756,171 @@ func TestRewriteCallerSearchDirsGetwdFails(t *testing.T) {
 	// Nothing to keep, so the working directory is never asked for.
 	if _, err := Rewrite(role, []string{"-L.", "-L/usr/lib"}, h); err != nil {
 		t.Errorf("err = %v with no absolute directory to keep", err)
+	}
+}
+
+// TestRewriteCallerSearchDirsSDKGuards pins each of keepCallerDir's guards
+// with a case that comes out wrong without it: the SDK compared through its
+// symlinks (the Command Line Tools' MacOSX.sdk is a symlink to the versioned
+// SDK beside it), the caller's directory compared through its symlinks, and
+// the SDK compared as a directory rather than a string prefix.
+func TestRewriteCallerSearchDirsSDKGuards(t *testing.T) {
+	const (
+		linkSDK = "/clt/SDKs/MacOSX.sdk"
+		realSDK = "/clt/SDKs/MacOSX15.sdk"
+	)
+	links := map[string]string{
+		linkSDK:        realSDK,
+		"/opt/sdkpath": fakeSDK + "/usr",
+	}
+	dirs := map[string]bool{
+		realSDK: true, realSDK + "/usr/lib": true, realSDK + "/extra/lib": true,
+		fakeSDK + "-extra/lib": true,
+	}
+	for k := range fakeDirs {
+		dirs[k] = true
+	}
+	eval := func(p string) (string, error) {
+		p = filepath.Clean(p)
+		for link, real := range links {
+			if rest, ok := strings.CutPrefix(p, link); ok && (rest == "" || rest[0] == '/') {
+				p = real + rest
+			}
+		}
+		if !dirs[p] {
+			return "", os.ErrNotExist
+		}
+		return p, nil
+	}
+	for _, c := range []struct {
+		name, sdk string
+		in, want  []string // want nil: the same as in
+	}{
+		{"inside the SDK the SDK path resolves to", linkSDK, []string{"-L" + realSDK + "/extra/lib"}, nil},
+		{"a symlink into the SDK", fakeSDK, []string{"-L/opt/sdkpath/lib", "-L", "/opt/sdkpath/lib"}, nil},
+		{"a sibling whose name extends the SDK's", fakeSDK, []string{"-L" + fakeSDK + "-extra/lib"}, []string{"-L../../../../sdk/MacOSX.sdk-extra/lib"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := fakeHost(darwinArm, map[string]string{"SDKROOT": c.sdk})
+			h.SDK.Dir = func(d string) error {
+				if _, err := eval(d); err != nil {
+					return fs.ErrNotExist
+				}
+				return nil
+			}
+			h.EvalSymlinks = eval
+			h.IsDir = func(d string) bool { _, err := eval(d); return err == nil }
+			role, _ := ParseRole("cc")
+			plan, err := Rewrite(role, c.in, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := c.want
+			if want == nil {
+				want = c.in
+			}
+			if got := plan.Args[len(plan.Args)-len(c.in):]; !reflect.DeepEqual(got, want) {
+				t.Errorf("args\n got %q\nwant %q", plan.Args, want)
+			}
+		})
+	}
+}
+
+// TestResponseFileArgs holds zig 0.17.0's own cases for the reader of a
+// `zig cc` @file (lib/std/process/Args.zig, "response file arg parsing"),
+// and a few of the shapes a build system writes.
+func TestResponseFileArgs(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want []string
+	}{
+		{"a b\nc d\\", []string{"a", "b", "c", "d\\"}},
+		{"a b c d\\", []string{"a", "b", "c", "d\\"}},
+		{"j\n k l # this is a comment \\\\ \\\\\\ \\\\\\\\ \"none\" \"\\\\\" \"\\\\\\\"\n \"m\" #another comment\n", []string{"j", "k", "l", "m"}},
+		{" \"\" q \"\"\n \"r s # t\" \"u\\\" v\" #another comment\n", []string{"", "q", "", "r s # t", "u\" v"}},
+		{" -l\"advapi32\" a# b#c d#\ne\\\\\\", []string{"-ladvapi32", "a#", "b#c", "d#", "e\\\\\\"}},
+		{" 'foo' \"bar\"", []string{"foo", "bar"}},
+		// Build systems' shapes.
+		{"", nil},
+		{"-L/a/b\r\n-lfoo\r\n", []string{"-L/a/b", "-lfoo"}},
+		{"\"-L/with space/lib\" -L '/x y'", []string{"-L/with space/lib", "-L", "/x y"}},
+		{"-DX=\\\"v\\\" C:\\dir\\", []string{"-DX=\"v\"", "C:\\dir\\"}},
+	} {
+		if got := ResponseFileArgs(c.in); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("ResponseFileArgs(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestRewriteCallerSearchDirsResponseFile is W1-F2.b, ruling R2 for a -L or
+// -F that arrives in an @file: the @file is passed as the caller wrote it,
+// and each absolute directory in it that zig would lose follows it, respelled
+// as a direct one is.
+func TestRewriteCallerSearchDirsResponseFile(t *testing.T) {
+	files := map[string]string{
+		"link.rsp": "-L/opt/homebrew/lib -lssl -lssl\n" +
+			"-F /opt/homebrew/Frameworks -framework Foo\n" +
+			"# -L/private/var/work/other/lib\n" +
+			"-L/usr/lib -Lrel -L/nonexistent/lib -L" + fakeSDK + "/usr/lib\n" +
+			"-Xlinker -L/private/var/work/other/lib\n" +
+			"'-L/private/var/work/pkg/lib' -o out\n",
+		"plain.rsp": "-c a.c -o a.o\n",
+	}
+	h := fakeHost(darwinArm, nil)
+	read := h.ReadFile
+	var asked []string
+	h.ReadFile = func(p string) ([]byte, error) {
+		if c, ok := files[p]; ok {
+			asked = append(asked, p)
+			return []byte(c), nil
+		}
+		return read(p)
+	}
+	for _, c := range []struct {
+		name     string
+		in, want []string
+	}{
+		{"kept directories follow the @file, in its order and the caller's form",
+			[]string{"main.o", "@link.rsp", "-o", "main"},
+			[]string{"main.o", "@link.rsp", "-L../../../../opt/homebrew/lib", "-F", "../../../../opt/homebrew/Frameworks", "-Llib", "-o", "main"}},
+		{"composes with a direct -L", []string{"-L/opt/homebrew/lib", "@link.rsp"},
+			[]string{"-L../../../../opt/homebrew/lib", "@link.rsp", "-L../../../../opt/homebrew/lib", "-F", "../../../../opt/homebrew/Frameworks", "-Llib"}},
+		{"an @file with nothing to keep", []string{"@plain.rsp"}, nil},
+		{"an @file the shim cannot read is left to zig", []string{"@missing.rsp"}, nil},
+		{"an @file as another flag's value is not read", []string{"-o", "@link.rsp", "-Xlinker", "@link.rsp"}, nil},
+		{"a lone @", []string{"@"}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			role, _ := ParseRole("cc")
+			plan, err := Rewrite(role, c.in, h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := c.want
+			if want == nil {
+				want = c.in
+			}
+			want = append(darwinPrefix("cc", "aarch64-macos.13.0"), want...)
+			if !reflect.DeepEqual(plan.Args, want) {
+				t.Errorf("args\n got %q\nwant %q", plan.Args, want)
+			}
+		})
+	}
+
+	// A Linux target re-roots nothing, so its @file is not read.
+	asked = nil
+	role, _ := ParseRole("x86_64-unknown-linux-gnu-cc")
+	plan, err := Rewrite(role, []string{"@link.rsp"}, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"cc", "-target", "x86_64-linux-gnu.2.31", "@link.rsp"}; !reflect.DeepEqual(plan.Args, want) || len(asked) != 0 {
+		t.Errorf("linux: args %q (read %q), want %q and no @file read", plan.Args, asked, want)
+	}
+
+	h.Getwd = func() (string, error) { return "", errors.New("getwd: no such file or directory") }
+	role, _ = ParseRole("cc")
+	if _, err := Rewrite(role, []string{"@link.rsp"}, h); err == nil || !strings.Contains(err.Error(), "-L/opt/homebrew/lib") {
+		t.Errorf("err = %v, want one naming -L/opt/homebrew/lib", err)
 	}
 }
