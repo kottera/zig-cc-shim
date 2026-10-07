@@ -2,6 +2,7 @@ package shim
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -20,6 +21,14 @@ type Host struct {
 	// for a compile to /dev/null whose output would otherwise land in the
 	// working directory.
 	TempOutput func(suffix string) (string, error)
+	// Getwd returns the working directory zig will run in, with every
+	// symlink resolved.
+	Getwd func() (string, error)
+	// EvalSymlinks resolves every symlink in a path, failing if it does not
+	// exist.
+	EvalSymlinks func(string) (string, error)
+	// IsDir reports whether a path is a directory.
+	IsDir func(string) bool
 }
 
 // Plan is what the shim replaces itself with: zig's arguments after the zig
@@ -37,7 +46,8 @@ type Plan struct {
 // For a compile role it supplies -target from the environment, drops a
 // caller's --target that restates it (and refuses one that does not), checks
 // the glibc floor on a Linux host building for Linux, and for a darwin target
-// adds the SDK flags and de-duplicates -framework X and -lX. For an x86_64
+// adds the SDK flags, keeps a caller's absolute -L and -F that name a
+// directory outside the SDK, and de-duplicates -framework X and -lX. For an x86_64
 // target it respells gcc's -march=x86-64[-vN] as zig's. On every platform, a
 // compile to /dev/null is given an output under $TMPDIR. Nothing else is
 // added: no host search path, and none of the rewrites of Uber's wrapper
@@ -69,6 +79,10 @@ func Rewrite(role Role, args []string, h Host) (Plan, error) {
 		}
 		plan.SDK = sdk
 		plan.Args = append(plan.Args, DarwinFlags(sdk)...)
+		args, err = CallerSearchDirs(args, sdk, h)
+		if err != nil {
+			return Plan{}, err
+		}
 		args = DedupDarwin(args)
 	}
 	if target.Arch == "amd64" {
@@ -249,6 +263,104 @@ func DedupDarwin(args []string) []string {
 		i += width - 1
 	}
 	return out
+}
+
+// CallerSearchDirs keeps a caller's absolute -L and -F on a darwin target.
+// Under --sysroot, zig joins every absolute -L and -F onto the SDK and drops
+// the result when it does not exist (kottera W1-A4, with zig 0.17.0), so
+// `#cgo LDFLAGS: -L${SRCDIR}/lib`, a Homebrew prefix or a Rust build script's
+// OUT_DIR is never searched. zig leaves a relative directory alone and opens
+// it from the working directory. So a -L<dir>, -L <dir>, -F<dir> or -F <dir>
+// whose dir is absolute, exists, lies outside the SDK, and has no
+// counterpart <sdk><dir> is respelled as the same directory relative to the
+// working directory, keeping the caller's form (kottera PLAN-2026-10-hermetic-
+// c-toolchain, ruling R2).
+//
+// The new spelling is derived only from the caller's argument and the
+// working directory: the shim names no host path of its own (ADR-155 D4).
+// Everything else is returned unchanged and left to zig: a relative
+// directory, one inside the SDK, one the SDK also has (so -L/usr/lib still
+// means <sdk>/usr/lib), and one that does not exist, which zig re-roots and
+// drops as before.
+func CallerSearchDirs(args []string, sdk string, h Host) ([]string, error) {
+	out := append([]string{}, args...)
+	var cwd string
+	for i := 0; i < len(out); i++ {
+		a := out[i]
+		flag, dir, joined := "", "", false
+		switch {
+		case (a == "-L" || a == "-F") && i+1 < len(out):
+			flag, dir = a, out[i+1]
+		case strings.HasPrefix(a, "-L") || strings.HasPrefix(a, "-F"):
+			flag, dir, joined = a[:2], a[2:], true
+		case takesValue[a]:
+			i++
+			continue
+		default:
+			continue
+		}
+		if !joined {
+			i++
+		}
+		if !keepCallerDir(dir, sdk, h) {
+			continue
+		}
+		if cwd == "" {
+			wd, err := h.Getwd()
+			if err != nil {
+				return nil, fmt.Errorf("zig-cc-shim: finding the working directory, to keep %s%s from being re-rooted under the SDK: %w", flag, dir, err)
+			}
+			cwd = wd
+		}
+		real, _ := h.EvalSymlinks(dir)
+		rel, err := filepath.Rel(cwd, real)
+		if err != nil {
+			return nil, fmt.Errorf("zig-cc-shim: spelling %s%s relative to %s: %w", flag, dir, cwd, err)
+		}
+		if strings.HasPrefix(rel, "-") {
+			rel = "./" + rel
+		}
+		if joined {
+			out[i] = flag + rel
+		} else {
+			out[i] = rel
+		}
+	}
+	return out, nil
+}
+
+// keepCallerDir reports whether zig would lose dir under --sysroot sdk while
+// the host has it: dir is absolute, is a directory outside the SDK, and
+// <sdk><dir> is not a directory.
+func keepCallerDir(dir, sdk string, h Host) bool {
+	if !filepath.IsAbs(dir) || h.IsDir(filepath.Join(sdk, dir)) {
+		return false
+	}
+	real, err := h.EvalSymlinks(dir)
+	if err != nil || !h.IsDir(real) {
+		return false
+	}
+	for _, root := range []string{sdk, resolvedOr(sdk, h)} {
+		for _, p := range []string{filepath.Clean(dir), real} {
+			if within(p, root) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// within reports whether p is root or lies beneath it.
+func within(p, root string) bool {
+	root = filepath.Clean(root)
+	return p == root || strings.HasPrefix(p, strings.TrimSuffix(root, "/")+"/")
+}
+
+func resolvedOr(p string, h Host) string {
+	if r, err := h.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
 }
 
 // marchX86 is gcc's and clang's x86-64 micro-architecture levels, spelled as

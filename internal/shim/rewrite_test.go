@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -44,8 +45,41 @@ func fakeHost(p Platform, env map[string]string) Host {
 				return fs.ErrNotExist
 			},
 		},
-		TempOutput: func(suffix string) (string, error) { return "/tmpdir/zig-cc-shim-out-1" + suffix, nil },
+		TempOutput:   func(suffix string) (string, error) { return "/tmpdir/zig-cc-shim-out-1" + suffix, nil },
+		Getwd:        func() (string, error) { return fakeCwd, nil },
+		EvalSymlinks: fakeEvalSymlinks,
+		IsDir:        func(d string) bool { return fakeDirs[d] },
 	}
+}
+
+// fakeCwd is the working directory of fakeHost, resolved.
+const fakeCwd = "/private/var/work/pkg"
+
+// fakeDirs is the directories of fakeHost, as resolved paths.
+var fakeDirs = map[string]bool{
+	fakeSDK: true, fakeSDK + "/usr/lib": true, fakeSDK + "/usr/include": true,
+	fakeSDK + "/System/Library/Frameworks": true,
+	"/usr/lib":                             true, "/System/Library/Frameworks": true,
+	"/opt/homebrew/lib": true, "/opt/homebrew/Frameworks": true,
+	"/private/var/work/pkg": true, "/private/var/work/pkg/lib": true, "/private/var/work/other/lib": true,
+	"/-odd": true,
+}
+
+// fakeSymlinks is the symlinks of fakeHost: /var is /private/var, as on
+// macOS.
+var fakeSymlinks = map[string]string{"/var": "/private/var"}
+
+func fakeEvalSymlinks(p string) (string, error) {
+	p = filepath.Clean(p)
+	for link, real := range fakeSymlinks {
+		if rest, ok := strings.CutPrefix(p, link); ok && (rest == "" || rest[0] == '/') {
+			p = real + rest
+		}
+	}
+	if !fakeDirs[p] {
+		return "", os.ErrNotExist
+	}
+	return p, nil
 }
 
 func darwinPrefix(driver, target string) []string {
@@ -625,5 +659,95 @@ func TestRewriteCallerTargetValues(t *testing.T) {
 	in = []string{"--target=aarch64-unknown-linux-gnu", "rcs", "x.a"}
 	if plan, err := Rewrite(ar, in, fakeHost(linuxAmd, nil)); err != nil || !reflect.DeepEqual(plan.Args[1:], in) {
 		t.Errorf("ar: %q %v", plan.Args, err)
+	}
+}
+
+// TestRewriteCallerSearchDirs pins kottera PLAN-2026-10-hermetic-c-toolchain
+// ruling R2: on darwin a caller's absolute -L and -F that name a directory
+// outside the SDK come out relative to the working directory, which zig does
+// not re-root under --sysroot, and everything else comes out as it went in.
+func TestRewriteCallerSearchDirs(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		in   []string
+		want []string // nil: the same as in
+	}{
+		{"joined -L under the working directory", []string{"-L/private/var/work/pkg/lib", "-lfoo"}, []string{"-Llib", "-lfoo"}},
+		{"separate -L keeps its form", []string{"-L", "/private/var/work/pkg/lib", "-lfoo"}, []string{"-L", "lib", "-lfoo"}},
+		{"the working directory itself", []string{"-L/private/var/work/pkg"}, []string{"-L."}},
+		{"a sibling of the working directory", []string{"-L/private/var/work/other/lib"}, []string{"-L../other/lib"}},
+		{"through a symlink", []string{"-L/var/work/other/lib"}, []string{"-L../other/lib"}},
+		{"a Homebrew prefix", []string{"-L/opt/homebrew/lib", "-lssl"}, []string{"-L../../../../opt/homebrew/lib", "-lssl"}},
+		{"joined -F", []string{"-F/opt/homebrew/Frameworks", "-framework", "Foo"}, []string{"-F../../../../opt/homebrew/Frameworks", "-framework", "Foo"}},
+		{"separate -F", []string{"-F", "/opt/homebrew/Frameworks"}, []string{"-F", "../../../../opt/homebrew/Frameworks"}},
+		{"several, in order", []string{"-L/opt/homebrew/lib", "-L.", "-L/private/var/work/pkg/lib"}, []string{"-L../../../../opt/homebrew/lib", "-L.", "-Llib"}},
+		// Left to zig.
+		{"relative -L", []string{"-L.", "-Llib", "-L", "lib"}, nil},
+		{"relative -F", []string{"-FFrameworks", "-F", "Frameworks"}, nil},
+		{"a directory the SDK also has", []string{"-L/usr/lib", "-F/System/Library/Frameworks"}, nil},
+		{"inside the SDK", []string{"-L" + fakeSDK + "/usr/lib", "-F", fakeSDK + "/System/Library/Frameworks"}, nil},
+		{"the SDK itself", []string{"-L" + fakeSDK}, nil},
+		{"a directory that does not exist", []string{"-L/nonexistent/lib", "-F", "/nonexistent/Frameworks"}, nil},
+		{"a -L that is another flag's value", []string{"-Xlinker", "-L/opt/homebrew/lib"}, nil},
+		{"a trailing -L with no value", []string{"-L"}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			role, _ := ParseRole("cc")
+			plan, err := Rewrite(role, c.in, fakeHost(darwinArm, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := c.want
+			if want == nil {
+				want = c.in
+			}
+			want = append(darwinPrefix("cc", "aarch64-macos.13.0"), want...)
+			if !reflect.DeepEqual(plan.Args, want) {
+				t.Errorf("args\n got %q\nwant %q", plan.Args, want)
+			}
+		})
+	}
+}
+
+func TestRewriteCallerSearchDirsDarwinOnly(t *testing.T) {
+	// No --sysroot on a Linux target, so zig re-roots nothing and the shim
+	// leaves an absolute -L alone.
+	in := []string{"-L/opt/homebrew/lib", "-F", "/opt/homebrew/Frameworks"}
+	role, _ := ParseRole("x86_64-unknown-linux-gnu-cc")
+	plan, err := Rewrite(role, in, fakeHost(darwinArm, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]string{"cc", "-target", "x86_64-linux-gnu.2.31"}, in...)
+	if !reflect.DeepEqual(plan.Args, want) {
+		t.Errorf("args\n got %q\nwant %q", plan.Args, want)
+	}
+}
+
+func TestRewriteCallerSearchDirsDash(t *testing.T) {
+	// From /, /-odd is -odd, which a separate -L would read as a flag.
+	h := fakeHost(darwinArm, nil)
+	h.Getwd = func() (string, error) { return "/", nil }
+	role, _ := ParseRole("cc")
+	plan, err := Rewrite(role, []string{"-L", "/-odd", "-L/-odd"}, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(darwinPrefix("cc", "aarch64-macos.13.0"), "-L", "./-odd", "-L./-odd")
+	if !reflect.DeepEqual(plan.Args, want) {
+		t.Errorf("args\n got %q\nwant %q", plan.Args, want)
+	}
+}
+
+func TestRewriteCallerSearchDirsGetwdFails(t *testing.T) {
+	h := fakeHost(darwinArm, nil)
+	h.Getwd = func() (string, error) { return "", errors.New("getwd: no such file or directory") }
+	role, _ := ParseRole("cc")
+	if _, err := Rewrite(role, []string{"-L/opt/homebrew/lib"}, h); err == nil || !strings.Contains(err.Error(), "-L/opt/homebrew/lib") {
+		t.Errorf("err = %v, want one naming -L/opt/homebrew/lib", err)
+	}
+	// Nothing to keep, so the working directory is never asked for.
+	if _, err := Rewrite(role, []string{"-L.", "-L/usr/lib"}, h); err != nil {
+		t.Errorf("err = %v with no absolute directory to keep", err)
 	}
 }

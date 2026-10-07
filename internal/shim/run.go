@@ -124,6 +124,15 @@ func RealHost() Host {
 			}
 			return f.Name(), f.Close()
 		},
+		Getwd: func() (string, error) {
+			wd, err := os.Getwd()
+			if err != nil {
+				return "", err
+			}
+			return filepath.EvalSymlinks(wd)
+		},
+		EvalSymlinks: filepath.EvalSymlinks,
+		IsDir:        func(p string) bool { return statDir(p) == nil },
 	}
 }
 

@@ -302,6 +302,95 @@ func TestZigKotteraRaceOnDarwin(t *testing.T) {
 	})
 }
 
+// TestZigCallerSearchDirsOnDarwin is kottera PLAN-2026-10-hermetic-c-toolchain
+// ruling R2: on darwin a caller's absolute -L and -F that name a directory
+// outside the SDK reach the link. A static library and a framework are built
+// in a temporary directory, which is outside the SDK, and a program in another
+// directory links each by its absolute path, in both the joined and the
+// separate spelling, and runs. The control arm runs first and pins the
+// property false: bare zig cc, given the same target and SDK flags, does not
+// find the library.
+func TestZigCallerSearchDirsOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("zig re-roots a caller's -L under the SDK only with --sysroot, which the shim passes on darwin; this host is %s", runtime.GOOS)
+	}
+	store := requireZigStore(t)
+	d := describe(t, store.role("cc"))
+	lib := t.TempDir()
+	if strings.HasPrefix(resolved(t, lib), resolved(t, d["sdk"])) {
+		t.Fatalf("the temporary directory %s is inside the SDK %s", lib, d["sdk"])
+	}
+
+	writeFile(t, lib, "add.c", "int add(int a, int b) { return a + b; }\n")
+	command(t, lib, nil, "", store.role("cc"), "-c", "add.c", "-o", "add.o")
+	command(t, lib, nil, "", store.role("ar"), "rcs", "libadd.a", "add.o")
+
+	fw := filepath.Join(lib, "Answer.framework")
+	if err := os.MkdirAll(filepath.Join(fw, "Headers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(fw, "Headers"), "answer.h", "int answer(void);\n")
+	writeFile(t, lib, "answer.c", "int answer(void) { return 42; }\n")
+	command(t, lib, nil, "", store.role("cc"), "-shared", "answer.c",
+		"-Wl,-install_name,"+filepath.Join(fw, "Answer"), "-o", filepath.Join(fw, "Answer"))
+
+	run := func(t *testing.T, dir string) {
+		t.Helper()
+		if out := command(t, dir, nil, "", filepath.Join(dir, "main")); out != "42\n" {
+			t.Errorf("main printed %q", out)
+		}
+	}
+	addMain := "#include <stdio.h>\nint add(int, int);\nint main(void) { printf(\"%d\\n\", add(40, 2)); return 0; }\n"
+
+	t.Run("control: bare zig cc drops the absolute -L", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "main.c", addMain)
+		args := append([]string{"cc", "-target", d["target"]}, shim.DarwinFlags(d["sdk"])...)
+		args = append(args, "main.c", "-L"+lib, "-ladd", "-o", "main")
+		cmd := exec.Command(store.zig, args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		t.Logf("MEASURE zig %s: %v\n%s", strings.Join(args, " "), err, out)
+		if err == nil {
+			t.Fatal("bare zig cc found libadd.a through an absolute -L under --sysroot, so the shim's rewriting " +
+				"is no longer what makes the shim arms pass and they prove nothing")
+		}
+		if !strings.Contains(string(out), "add") {
+			t.Fatalf("bare zig cc failed, but its error does not name the library add, so this is not the "+
+				"failure the shim fixes:\n%s", out)
+		}
+	})
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	for _, flags := range [][]string{{"-L" + lib}, {"-L", lib}} {
+		t.Run("shim: cc links -ladd through "+spelling(flags), func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "main.c", addMain)
+			command(t, dir, nil, "", store.role("cc"), append(append([]string{"main.c"}, flags...), "-ladd", "-o", "main")...)
+			run(t, dir)
+		})
+	}
+	for _, flags := range [][]string{{"-F" + lib}, {"-F", lib}} {
+		t.Run("shim: cc compiles and links -framework Answer through "+spelling(flags), func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "main.c", "#include <stdio.h>\n#include <Answer/answer.h>\n"+
+				"int main(void) { printf(\"%d\\n\", answer()); return 0; }\n")
+			command(t, dir, nil, "", store.role("cc"), append(append([]string{"main.c"}, flags...), "-framework", "Answer", "-o", "main")...)
+			run(t, dir)
+		})
+	}
+}
+
+// spelling names a -L or -F's form for a subtest: -L<dir> or "-L <dir>".
+func spelling(flags []string) string {
+	if len(flags) == 2 {
+		return flags[0] + " <dir>"
+	}
+	return flags[0][:2] + "<dir>"
+}
+
 // tail returns the last n lines of out.
 func tail(out []byte, n int) string {
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
