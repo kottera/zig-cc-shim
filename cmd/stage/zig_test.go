@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"debug/elf"
+	"debug/macho"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -630,4 +632,209 @@ func TestCompareVersions(t *testing.T) {
 			t.Errorf("compareVersions(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
 		}
 	}
+}
+
+// nodeGypBundleFlags is the link node-gyp runs for a macOS module (kottera
+// W3-A3), less the output and the object: `c++ -bundle -undefined
+// dynamic_lookup ... -o Release/<name>.node <objects>`.
+var nodeGypBundleFlags = []string{"-bundle", "-undefined", "dynamic_lookup", "-Wl,-search_paths_first",
+	"-mmacosx-version-min=10.7", "-arch", "arm64", "-L./Release", "-stdlib=libc++"}
+
+// bundleModule is a loadable module that calls host_value, which it leaves
+// undefined for the loader to supply under -undefined dynamic_lookup, as a
+// node addon leaves node's napi_* functions.
+const bundleModule = "int host_value(void);\nint module_value(void) { return host_value() + 2; }\n"
+
+// bundleHost loads the module named by argv[1] with dlopen, as node loads an
+// addon, and prints what its module_value returns.
+const bundleHost = `#include <dlfcn.h>
+#include <stdio.h>
+__attribute__((visibility("default"))) int host_value(void) { return 40; }
+int main(int argc, char **argv) {
+	void *m = dlopen(argv[1], RTLD_NOW);
+	if (!m) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+	int (*f)(void) = (int (*)(void))dlsym(m, "module_value");
+	if (!f) { fprintf(stderr, "dlsym: %s\n", dlerror()); return 1; }
+	printf("%d\n", f());
+	return 0;
+}
+`
+
+// TestZigBundleOnDarwin is kottera W3-A3: node-gyp links a macOS module with
+// `-bundle -undefined dynamic_lookup`, and zig 0.17.0 does not link a bundle.
+// It links an executable, so plain -bundle fails for want of _main, and with
+// -undefined dynamic_lookup its Mach-O linker crashes. The control arm runs
+// first and pins that: bare zig c++, given the shim's target and SDK flags
+// and node-gyp's link, does not produce a module. Then node-gyp's link through
+// the shim must produce a Mach-O module that a host program dlopen()s and that
+// resolves its undefined symbol against that host, and, when node is on PATH
+// with its headers, an N-API addon that node require()s and runs.
+func TestZigBundleOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("-bundle is a Mach-O output type; this host is %s", runtime.GOOS)
+	}
+	store := requireZigStore(t)
+	d := describe(t, store.role("c++"))
+	flags := slices.Clip(slices.Clone(nodeGypBundleFlags))
+	flags[6] = map[string]string{"arm64": "arm64", "amd64": "x86_64"}[runtime.GOARCH]
+
+	module := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "Release", "obj"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, dir, "module.c", bundleModule)
+		command(t, dir, nil, "", store.role("cc"), "-fPIC", "-c", "module.c", "-o", "Release/obj/module.o")
+		return dir
+	}
+
+	t.Run("control: bare zig c++ does not link node-gyp's -bundle", func(t *testing.T) {
+		dir := module(t)
+		args := append([]string{"c++", "-target", d["target"]}, shim.DarwinFlags(d["sdk"])...)
+		args = append(append(args, flags...), "-o", "Release/module.node", "Release/obj/module.o")
+		cmd := exec.Command(store.zig, args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		t.Logf("MEASURE zig %s: %v\n%s", strings.Join(args, " "), err, out)
+		if err == nil {
+			t.Fatalf("bare zig c++ linked node-gyp's -bundle (output type %s), so zig now links a bundle and "+
+				"the shim's -bundle rewrite is no longer needed", machoType(t, filepath.Join(dir, "Release", "module.node")))
+		}
+	})
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	t.Run("shim: node-gyp's link produces a module a host dlopen()s", func(t *testing.T) {
+		dir := module(t)
+		command(t, dir, nil, "", store.role("c++"), append(flags, "-o", "Release/module.node", "Release/obj/module.o")...)
+		node := filepath.Join(dir, "Release", "module.node")
+		if typ := machoType(t, node); typ != "Dylib" {
+			t.Errorf("node-gyp's link through the shim produced a Mach-O %s, want the Dylib that -shared links", typ)
+		}
+		writeFile(t, dir, "host.c", bundleHost)
+		command(t, dir, nil, "", store.role("cc"), "host.c", "-o", "host")
+		if out := command(t, dir, nil, "", filepath.Join(dir, "host"), node); out != "42\n" {
+			t.Errorf("host printed %q", out)
+		}
+	})
+
+	t.Run("shim: node require()s an N-API addon linked with node-gyp's flags", func(t *testing.T) {
+		nodeExe, err := exec.LookPath("node")
+		if err != nil {
+			t.Skip("node is not on PATH, so there is no node to require() the addon")
+		}
+		include := filepath.Join(filepath.Dir(filepath.Dir(resolved(t, nodeExe))), "include", "node")
+		if _, err := os.Stat(filepath.Join(include, "node_api.h")); err != nil {
+			t.Skipf("node at %s has no node_api.h in %s, so there are no headers to build an addon against", nodeExe, include)
+		}
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, "Release", "obj"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, dir, "addon.c", napiAddon)
+		command(t, dir, nil, "", store.role("c++"), "-x", "c", "-I"+include, "-fPIC", "-c", "addon.c", "-o", "Release/obj/addon.o")
+		command(t, dir, nil, "", store.role("c++"), append(flags, "-o", "Release/addon.node", "Release/obj/addon.o")...)
+		out := command(t, dir, nil, "", nodeExe, "-e", `console.log(require("./Release/addon.node").add(40, 2))`)
+		if out != "42\n" {
+			t.Errorf("node printed %q", out)
+		}
+	})
+}
+
+// TestZigBundleLoaderRefused: only a bundle can name a -bundle_loader, so the
+// shim, which links -bundle as a dylib, refuses -bundle with one rather than
+// linking something that ignores it. The refusal comes before zig runs.
+func TestZigBundleLoaderRefused(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("-bundle is rewritten for a darwin target only; this host is %s", runtime.GOOS)
+	}
+	store := requireZigStore(t)
+	dir := t.TempDir()
+	writeFile(t, dir, "module.c", bundleModule)
+	cmd := exec.Command(store.role("cc"), "-bundle", "-bundle_loader", "/bin/ls", "module.c", "-o", "module.so")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if code := cmd.ProcessState.ExitCode(); err == nil || code != 1 || !strings.Contains(string(out), "refused") ||
+		!strings.Contains(string(out), "-bundle_loader") {
+		t.Fatalf("cc -bundle -bundle_loader: exit %d, want 1 with a refusal naming -bundle_loader:\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "module.so")); err == nil {
+		t.Error("the refused link wrote module.so")
+	}
+}
+
+// TestZigLinuxLinkLineSearchDirs records what kottera W3-A2 found on zig's
+// own Linux link line: zig 0.17.0 passes ld.lld `--as-needed -L/` before its
+// glibc stubs, on every dynamic link, and the shim passes no -L. The `-L/` is
+// a literal in zig's ELF linker driver, not anything the shim names, and no
+// zig cc argument removes it without changing what is linked (-static,
+// -nostdlib and -nolibc do). It is inert: zig resolves every -l itself, against
+// the caller's -L only, and hands ld.lld the library's absolute path, so the
+// line carries no -l for ld.lld to search / with. This test pins both halves:
+// every -L on zig's final link line is zig's -L/, and no -l reaches ld.lld.
+// A zig that stops passing -L/ still passes this test, and logs that it did.
+func TestZigLinuxLinkLineSearchDirs(t *testing.T) {
+	store := requireZigStore(t)
+	role := "x86_64-unknown-linux-gnu-cc"
+	if runtime.GOOS == "linux" {
+		role = "cc"
+	}
+	dir := t.TempDir()
+	writeFile(t, dir, "main.c", "#include <math.h>\n#include <stdio.h>\nint main(void) { printf(\"%g\\n\", sqrt(4.0)); return 0; }\n")
+	out := command(t, dir, []string{"ZIG_VERBOSE_LINK=1"}, "", store.role(role), "main.c", "-lm", "-o", "main")
+	var link string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.HasPrefix(line, "ld.lld ") && strings.Contains(line, " -o main ") {
+			link = line
+		}
+	}
+	if link == "" {
+		t.Fatalf("no ld.lld line linking main in zig's verbose output:\n%s", out)
+	}
+	t.Logf("MEASURE zig's final link line: %s", link)
+	rootDir := false
+	for _, a := range strings.Fields(link) {
+		switch {
+		case a == "-L/":
+			rootDir = true
+		case strings.HasPrefix(a, "-L"):
+			t.Errorf("zig's link line carries %s, a search directory other than zig's own -L/", a)
+		case strings.HasPrefix(a, "-l"):
+			t.Errorf("zig's link line carries %s, which ld.lld would search the -L directories for", a)
+		}
+	}
+	t.Logf("MEASURE zig's link line carries -L/: %v", rootDir)
+}
+
+// napiAddon is an N-API addon exporting add(a, b).
+const napiAddon = `#include <node_api.h>
+static napi_value Add(napi_env env, napi_callback_info info) {
+	size_t argc = 2;
+	napi_value argv[2], r;
+	double a, b;
+	napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+	napi_get_value_double(env, argv[0], &a);
+	napi_get_value_double(env, argv[1], &b);
+	napi_create_double(env, a + b, &r);
+	return r;
+}
+NAPI_MODULE_INIT() {
+	napi_value fn;
+	napi_create_function(env, "add", NAPI_AUTO_LENGTH, Add, NULL, &fn);
+	napi_set_named_property(env, exports, "add", fn);
+	return exports;
+}
+`
+
+// machoType names the Mach-O file type of the file at path.
+func machoType(t *testing.T, path string) string {
+	t.Helper()
+	f, err := macho.Open(path)
+	if err != nil {
+		t.Fatalf("reading %s as Mach-O: %v", path, err)
+	}
+	defer f.Close()
+	return f.Type.String()
 }

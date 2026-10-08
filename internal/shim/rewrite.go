@@ -3,6 +3,7 @@ package shim
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -48,8 +49,9 @@ type Plan struct {
 // caller's --target that restates it (and refuses one that does not), checks
 // the glibc floor on a Linux host building for Linux, and for a darwin target
 // adds the SDK flags, keeps a caller's absolute -L and -F that name a
-// directory outside the SDK (given directly or in an @file), and
-// de-duplicates -framework X and -lX. For an x86_64
+// directory outside the SDK (given directly or in an @file),
+// de-duplicates -framework X and -lX, and links -bundle as -shared (refusing
+// a -bundle_loader, which only a bundle honours). For an x86_64
 // target it respells gcc's -march=x86-64[-vN] as zig's. On every platform, a
 // compile to /dev/null is given an output under $TMPDIR. Nothing else is
 // added: no host search path, and none of the rewrites of Uber's wrapper
@@ -86,6 +88,10 @@ func Rewrite(role Role, args []string, h Host) (Plan, error) {
 			return Plan{}, err
 		}
 		args = DedupDarwin(args)
+		args, err = BundleAsDylib(role.Name, args, h.ReadFile)
+		if err != nil {
+			return Plan{}, err
+		}
 	}
 	if target.Arch == "amd64" {
 		args = MarchX86(args)
@@ -108,7 +114,7 @@ var takesValue = map[string]bool{
 	"--sysroot": true, "-MF": true, "-MT": true, "-MQ": true, "-MJ": true,
 	"-target": true, "-arch": true, "-mllvm": true,
 	"-Xlinker": true, "-Xclang": true, "-Xassembler": true, "-Xpreprocessor": true,
-	"-weak_framework": true, "-install_name": true, "-rpath": true,
+	"-weak_framework": true, "-bundle_loader": true, "-install_name": true, "-rpath": true,
 	"-z": true, "-T": true, "-e": true, "-u": true,
 }
 
@@ -265,6 +271,75 @@ func DedupDarwin(args []string) []string {
 		i += width - 1
 	}
 	return out
+}
+
+// BundleAsDylib replaces every -bundle with -shared on a darwin target.
+// zig 0.17.0 does not link a Mach-O bundle: it links an executable, so a
+// plain -bundle fails with "undefined symbol: _main", and node-gyp's macOS
+// module link, `-bundle -undefined dynamic_lookup`, crashes zig's Mach-O
+// linker with a segmentation fault (kottera W3-A3, reproduced with zig
+// invoked directly). zig links -shared as an MH_DYLIB, which dlopen loads as
+// it loads a bundle, so node require()s it and its undefined symbols resolve
+// against node under -undefined dynamic_lookup.
+//
+// What the rewrite changes is the file type: the output is MH_DYLIB, not
+// MH_BUNDLE, and carries an install name (its -o path). A loader that
+// accepts only a bundle (the long-deprecated NSCreateObjectFileImageFromFile)
+// would not load it. And a bundle alone may link against an executable's
+// symbols with -bundle_loader, which a dylib cannot honour, so -bundle with
+// -bundle_loader is refused rather than linked as something the caller did
+// not ask for. So is a -bundle inside an @file, which the shim cannot
+// respell without rewriting the caller's file. -Wl,-bundle and -Xlinker
+// -bundle are left alone: zig 0.17.0 itself refuses them ("unsupported
+// linker arg"). Every other argument is returned unchanged.
+func BundleAsDylib(roleName string, args []string, readFile func(string) ([]byte, error)) ([]string, error) {
+	bundle, loader, file := false, "", ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-bundle":
+			bundle = true
+		case a == "-bundle_loader" && i+1 < len(args):
+			loader = args[i+1]
+			i++
+		case strings.HasPrefix(a, "@") && len(a) > 1 && file == "":
+			if content, err := readFile(a[1:]); err == nil && slices.Contains(ResponseFileArgs(string(content)), "-bundle") {
+				file = a
+			}
+		case takesValue[a]:
+			i++
+		}
+	}
+	why := "zig 0.17.0 does not link a Mach-O bundle (it links -bundle as an executable, and crashes with -undefined dynamic_lookup), so the shim links -bundle as -shared, an MH_DYLIB, which dlopen loads as it loads a bundle"
+	switch {
+	case file != "":
+		return nil, &Refusal{
+			Role:    roleName,
+			Missing: "a -bundle the shim can respell: " + quote(file) + " passes -bundle in a response file",
+			Why:     why + "; the shim respells only its own command line and never rewrites the caller's file",
+			Repair:  "pass -bundle on the command line rather than in " + quote(file) + ", or link with -shared",
+		}
+	case bundle && loader != "":
+		return nil, &Refusal{
+			Role:    roleName,
+			Missing: "an MH_BUNDLE for -bundle_loader " + quote(loader) + ": the caller asked for a bundle that links against that executable's symbols",
+			Why:     why + "; only a bundle can name a -bundle_loader, so linking a dylib instead would silently drop it",
+			Repair:  "drop -bundle_loader " + quote(loader) + " and link with -undefined dynamic_lookup, so the symbols resolve against the loading executable at load time, or build the bundle with Apple's toolchain",
+		}
+	case !bundle:
+		return args, nil
+	}
+	out := make([]string, len(args))
+	for i := 0; i < len(args); i++ {
+		out[i] = args[i]
+		if args[i] == "-bundle" {
+			out[i] = "-shared"
+		} else if takesValue[args[i]] && i+1 < len(args) {
+			i++
+			out[i] = args[i]
+		}
+	}
+	return out, nil
 }
 
 // CallerSearchDirs keeps a caller's absolute -L and -F on a darwin target.

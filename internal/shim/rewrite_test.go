@@ -924,3 +924,107 @@ func TestRewriteCallerSearchDirsResponseFile(t *testing.T) {
 		t.Errorf("err = %v, want one naming -L/opt/homebrew/lib", err)
 	}
 }
+
+func TestRewriteBundle(t *testing.T) {
+	nodeGyp := []string{"-bundle", "-undefined", "dynamic_lookup", "-Wl,-search_paths_first",
+		"-mmacosx-version-min=10.7", "-arch", "arm64", "-L./Release", "-stdlib=libc++",
+		"-o", "Release/bufferutil.node", "Release/obj.target/bufferutil/src/bufferutil.o"}
+	for _, c := range []struct {
+		name string
+		in   []string
+		want []string // nil: the same as in
+	}{
+		{"node-gyp's module link", nodeGyp, append([]string{"-shared"}, nodeGyp[1:]...)},
+		{"plain -bundle", []string{"-bundle", "m.o", "-o", "m.so"}, []string{"-shared", "m.o", "-o", "m.so"}},
+		{"every -bundle", []string{"-bundle", "m.o", "-bundle"}, []string{"-shared", "m.o", "-shared"}},
+		{"beside -shared", []string{"-shared", "-bundle", "m.o"}, []string{"-shared", "-shared", "m.o"}},
+		{"a -bundle_loader without -bundle is left alone", []string{"-shared", "-bundle_loader", "/bin/ls", "m.o"}, nil},
+		{"a -bundle that is another flag's value", []string{"-Xlinker", "-bundle", "-o", "-bundle", "m.o"}, nil},
+		{"-Wl,-bundle, which zig refuses itself", []string{"-Wl,-bundle", "m.o"}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			role, _ := ParseRole("c++")
+			plan, err := Rewrite(role, c.in, fakeHost(darwinArm, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := c.want
+			if want == nil {
+				want = c.in
+			}
+			want = append(darwinPrefix("c++", "aarch64-macos.13.0"), want...)
+			if !reflect.DeepEqual(plan.Args, want) {
+				t.Errorf("args\n got %q\nwant %q", plan.Args, want)
+			}
+		})
+	}
+}
+
+func TestRewriteBundleIsDarwinOnly(t *testing.T) {
+	in := []string{"-bundle", "-bundle_loader", "/bin/ls", "m.o"}
+	for _, c := range []rewriteCase{
+		{linuxAmd, "cc", in},
+		{darwinArm, "x86_64-unknown-linux-gnu-cc", in},
+		{darwinArm, "ar", in},
+	} {
+		role, _ := ParseRole(c.role)
+		plan, err := Rewrite(role, in, fakeHost(c.host, nil))
+		if err != nil {
+			t.Fatalf("%v %s: %v", c.host, c.role, err)
+		}
+		if got := plan.Args[len(plan.Args)-len(in):]; !reflect.DeepEqual(got, in) {
+			t.Errorf("%v %s: got %q want suffix %q", c.host, c.role, plan.Args, in)
+		}
+	}
+	role, _ := ParseRole("x86_64-apple-darwin-cc")
+	plan, err := Rewrite(role, []string{"-bundle", "m.o"}, fakeHost(linuxAmd, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := append(darwinPrefix("cc", "x86_64-macos.13.0"), "-shared", "m.o"); !reflect.DeepEqual(plan.Args, want) {
+		t.Errorf("a darwin triple role on Linux: args\n got %q\nwant %q", plan.Args, want)
+	}
+}
+
+func TestRewriteBundleRefused(t *testing.T) {
+	h := fakeHost(darwinArm, nil)
+	read := h.ReadFile
+	h.ReadFile = func(p string) ([]byte, error) {
+		switch p {
+		case "bundle.rsp":
+			return []byte("# a module\n-bundle -undefined dynamic_lookup\n"), nil
+		case "plain.rsp":
+			return []byte("-shared -o m.so # -bundle\n"), nil
+		}
+		return read(p)
+	}
+	role, _ := ParseRole("c++")
+	for _, c := range []struct {
+		name string
+		in   []string
+		want []string // what the refusal names
+	}{
+		{"-bundle_loader", []string{"-bundle", "-bundle_loader", "/usr/local/bin/app", "m.o"}, []string{"-bundle_loader", "/usr/local/bin/app", "MH_BUNDLE", "-undefined dynamic_lookup"}},
+		{"-bundle_loader first", []string{"-bundle_loader", "/usr/local/bin/app", "m.o", "-bundle"}, []string{"-bundle_loader"}},
+		{"-bundle in an @file", []string{"@bundle.rsp", "m.o"}, []string{"@bundle.rsp", "response file", "command line"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Rewrite(role, c.in, h)
+			var r *Refusal
+			if !errors.As(err, &r) {
+				t.Fatalf("err = %v, want a refusal", err)
+			}
+			for _, w := range append(c.want, "zig 0.17.0 does not link a Mach-O bundle") {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("refusal does not name %q:\n%s", w, err)
+				}
+			}
+		})
+	}
+	// An @file with no -bundle, or one the shim cannot read, is left to zig.
+	for _, in := range [][]string{{"@plain.rsp", "m.o"}, {"@missing.rsp"}, {"-o", "@bundle.rsp", "m.o"}} {
+		if _, err := Rewrite(role, in, h); err != nil {
+			t.Errorf("%q: %v", in, err)
+		}
+	}
+}
