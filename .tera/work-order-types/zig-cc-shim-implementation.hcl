@@ -1,6 +1,6 @@
 version = "v1"
 
-# Implementation work in kottera/zig-cc-shim: the dogfood deployment's
+# Implementation work in kottera/zig-cc-shim: the dev-pipeline built-in's
 # code-implementation-direct, with this repository's description and nothing
 # else (kottera ADR-155 D3, ADR-147 D8). Everything not declared here — the
 # harness and its instructions, the inputs, the record, the postconditions,
@@ -16,6 +16,6 @@ version = "v1"
 # PLAN-2026-10-hermetic-c-toolchain declares this repository's own.
 
 work_order_type "zig-cc-shim-implementation" {
-  based_on    = "system/work-order-types/code-implementation-direct"
+  based_on    = "plugin.dev-pipeline/work-order-types/code-implementation-direct"
   description = "Implement a change to kottera/zig-cc-shim end-to-end: branch, change, verify with the repository gate `go run ./cmd/gate` (it prints `gate: ok`; README.md, \"The gate\"), then open and merge the pull request."
 }
