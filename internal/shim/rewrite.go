@@ -50,8 +50,9 @@ type Plan struct {
 // the glibc floor on a Linux host building for Linux, and for a darwin target
 // adds the SDK flags, keeps a caller's absolute -L and -F that name a
 // directory outside the SDK (given directly or in an @file),
-// de-duplicates -framework X and -lX, and links -bundle as -shared (refusing
-// a -bundle_loader, which only a bundle honours). For an x86_64
+// de-duplicates -framework X and -lX, removes the linker's -U <symbol>, and
+// links -bundle as -shared (refusing a -bundle_loader, which only a bundle
+// honours). For an x86_64
 // target it respells gcc's -march=x86-64[-vN] as zig's. On every platform, a
 // compile to /dev/null is given an output under $TMPDIR. Nothing else is
 // added: no host search path, and none of the rewrites of Uber's wrapper
@@ -88,6 +89,7 @@ func Rewrite(role Role, args []string, h Host) (Plan, error) {
 			return Plan{}, err
 		}
 		args = DedupDarwin(args)
+		args = DropAllowUndefined(args)
 		args, err = BundleAsDylib(role.Name, args, h.ReadFile)
 		if err != nil {
 			return Plan{}, err
@@ -271,6 +273,62 @@ func DedupDarwin(args []string) []string {
 		i += width - 1
 	}
 	return out
+}
+
+// DropAllowUndefined removes every linker -U <symbol> on a darwin target:
+// -Wl,-U,<symbol>, alone or among a -Wl's other arguments, and -Xlinker -U
+// -Xlinker <symbol>. zig 0.17.0 refuses it ("unsupported linker arg: -U"), and
+// Go passes it on every external -race link (cmd/link's lib.go), so without
+// this no cgo package links under -race. What Go asks for is that the race
+// object's weak import of __dyld_get_dyld_header may stay undefined, which
+// macOS has from 26.4, and zig's Mach-O linker already allows a weak import
+// that: measured on macOS 15.8.1 with SDK 15.5, where neither the SDK nor the
+// system has the symbol, the program links and loads and the race detector
+// reports a race. Dropping it asks more of a link, never less: a -U for a
+// strong symbol nothing defines fails the link with "undefined symbol". So
+// -undefined dynamic_lookup is not used in its place: that links such a
+// symbol, and the program faults when it calls it.
+//
+// A bare -U NAME is the preprocessor's and is left alone, as is a -U in an
+// @file, since the shim never rewrites the caller's file; zig then refuses it
+// by name.
+func DropAllowUndefined(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-Xlinker" && i+3 < len(args) && args[i+1] == "-U" && args[i+2] == "-Xlinker":
+			i += 3
+		case takesValue[a] && i+1 < len(args):
+			out = append(out, a, args[i+1])
+			i++
+		case strings.HasPrefix(a, "-Wl,"):
+			if kept := dropWlAllowUndefined(a); kept != "" {
+				out = append(out, kept)
+			}
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// dropWlAllowUndefined is the -Wl argument a with each -U <symbol> pair
+// removed, or "" when nothing else is left in it.
+func dropWlAllowUndefined(a string) string {
+	fields := strings.Split(strings.TrimPrefix(a, "-Wl,"), ",")
+	kept := make([]string, 0, len(fields))
+	for i := 0; i < len(fields); i++ {
+		if fields[i] == "-U" && i+1 < len(fields) {
+			i++
+			continue
+		}
+		kept = append(kept, fields[i])
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return "-Wl," + strings.Join(kept, ",")
 }
 
 // BundleAsDylib replaces every -bundle with -shared on a darwin target.

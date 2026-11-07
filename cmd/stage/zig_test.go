@@ -285,11 +285,10 @@ func writeFile(t *testing.T, dir, name, content string) {
 // PLAN-2026-10-hermetic-c-toolchain section 4): `go test -race
 // ./pkg/toolchain` of a kottera checkout passes with CC and CXX at the shim.
 // The control arm runs first and pins the property false: bare `zig cc`, with
-// the same target and SDK flags but no de-duplication, links CoreFoundation
-// twice and the test binary aborts in dyld.
+// the same target and SDK flags, refuses the -U Go passes on a -race link.
 func TestZigKotteraRaceOnDarwin(t *testing.T) {
 	if runtime.GOOS != "darwin" {
-		t.Skipf("the duplicated CoreFoundation is a darwin failure; this host is %s", runtime.GOOS)
+		t.Skipf("this proof is of a darwin link; this host is %s", runtime.GOOS)
 	}
 	store := requireZigStore(t)
 	checkout := os.Getenv(EnvKottera)
@@ -329,16 +328,16 @@ func TestZigKotteraRaceOnDarwin(t *testing.T) {
 		return string(out), err
 	}
 
-	t.Run("control: bare zig cc aborts on the duplicated CoreFoundation", func(t *testing.T) {
+	t.Run("control: bare zig cc cannot link it", func(t *testing.T) {
 		defer os.Remove(litter) // the control's own -.o, which the shim must not write
 		out, err := goTest(t, store.zig+" cc "+bareFlags, store.zig+" c++ "+bareFlags)
 		if err == nil {
-			t.Fatal("go test -race passed through bare zig cc, so the shim's de-duplication is no longer what " +
-				"makes it pass and the shim arm proves nothing")
+			t.Fatal("go test -race passed through bare zig cc, so the shim is no longer what makes it pass " +
+				"and the shim arm proves nothing")
 		}
-		if !strings.Contains(out, "duplicate linked dylib") || !strings.Contains(out, "CoreFoundation") {
-			t.Fatalf("go test -race failed through bare zig cc, but not with dyld's duplicate linked dylib "+
-				"CoreFoundation, so this is not the failure the shim fixes:\n%s", out)
+		if !strings.Contains(out, "unsupported linker arg: -U") {
+			t.Fatalf("go test -race failed through bare zig cc, but not on the linker's -U, so this is not "+
+				"the failure the shim fixes:\n%s", out)
 		}
 	})
 	if t.Failed() {
@@ -515,6 +514,64 @@ func main() {
 	fmt.Println("cgo says", sum)
 }
 `
+
+// A native cgo -race build on darwin: Go passes -Wl,-U,__dyld_get_dyld_header
+// on that link, which bare zig refuses. The control fails the test the day zig
+// learns it, so the shim's rewrite is then removed rather than kept. The
+// program must load and run where the system lacks the symbol, and a symbol
+// nothing defines must still fail the link, which is what
+// -undefined dynamic_lookup in its place would lose.
+func TestZigCgoRaceOnDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skipf("-Wl,-U is Go's darwin link; this host is %s", runtime.GOOS)
+	}
+	store := requireZigStore(t)
+	d := describe(t, store.role("cc"))
+	env := []string{"CGO_ENABLED=1", "CC=" + store.role("cc"), "CXX=" + store.role("c++")}
+
+	t.Run("control: bare zig cc refuses the linker's -U", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "a.c", "int main(void) { return 0; }\n")
+		args := append([]string{"cc", "-target", d["target"]}, shim.DarwinFlags(d["sdk"])...)
+		args = append(args, "-Wl,-U,__dyld_get_dyld_header", "a.c", "-o", "a")
+		cmd := exec.Command(store.zig, args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		t.Logf("MEASURE zig %s: %v\n%s", strings.Join(args, " "), err, out)
+		if err == nil {
+			t.Fatal("bare zig cc took -Wl,-U, so the shim's rewrite is no longer needed")
+		}
+		if !strings.Contains(string(out), "unsupported linker arg: -U") {
+			t.Fatalf("bare zig cc failed for another reason:\n%s", out)
+		}
+	})
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	t.Run("shim: a cgo -race program links and runs", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "go.mod", "module cgorace\n\ngo 1.21\n")
+		writeFile(t, dir, "main.go", cgoRaceProgram)
+		command(t, dir, env, "", "go", "build", "-race", "-o", "prog", ".")
+		if out := command(t, dir, nil, "", filepath.Join(dir, "prog")); out != "cgo says 46\n" {
+			t.Errorf("prog printed %q", out)
+		}
+	})
+
+	t.Run("shim: a symbol nothing defines still fails the link", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "go.mod", "module cgorace\n\ngo 1.21\n")
+		writeFile(t, dir, "main.go", "package main\n\n// extern int no_such_function(void);\nimport \"C\"\n\nfunc main() { C.no_such_function() }\n")
+		cmd := exec.Command("go", "build", "-race", "-o", "prog", ".")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), env...)
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "undefined symbol") {
+			t.Errorf("want the link to fail naming an undefined symbol: %v\n%s", err, tail(out, 12))
+		}
+	})
+}
 
 // TestZigCgoRaceGlibcCeiling builds a cgo program with -race through the
 // shim and asserts that the highest GLIBC_ symbol version it requires is at or
