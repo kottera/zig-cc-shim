@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -211,6 +212,62 @@ func TestDedupDarwin(t *testing.T) {
 				t.Errorf("got %q want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestDropAllowUndefined(t *testing.T) {
+	cases := []struct {
+		name     string
+		in, want []string
+	}{
+		{"go's race link",
+			[]string{"-arch", "arm64", "-Wl,-S", "-Wl,-U,__dyld_get_dyld_header", "-o", "a.test", "a.o"},
+			[]string{"-arch", "arm64", "-Wl,-S", "-o", "a.test", "a.o"}},
+		{"beside other linker arguments",
+			[]string{"-Wl,-S,-U,_a,-x,-U,_b,-dead_strip"},
+			[]string{"-Wl,-S,-x,-dead_strip"}},
+		{"through -Xlinker",
+			[]string{"a.o", "-Xlinker", "-U", "-Xlinker", "_a", "-lz"},
+			[]string{"a.o", "-lz"}},
+		{"the preprocessor's -U is not the linker's",
+			[]string{"-U", "NDEBUG", "-UFOO", "-c", "a.c"},
+			[]string{"-U", "NDEBUG", "-UFOO", "-c", "a.c"}},
+		{"a value is not a flag",
+			[]string{"-o", "-Wl,-U,_a", "-Xlinker", "-S"},
+			[]string{"-o", "-Wl,-U,_a", "-Xlinker", "-S"}},
+		{"a -U with no symbol is the linker's to refuse",
+			[]string{"-Wl,-U"},
+			[]string{"-Wl,-U"}},
+		{"-undefined is not -U",
+			[]string{"-undefined", "dynamic_lookup", "-Wl,-undefined,dynamic_lookup"},
+			[]string{"-undefined", "dynamic_lookup", "-Wl,-undefined,dynamic_lookup"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := DropAllowUndefined(c.in); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("got %q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRewriteDropsAllowUndefinedOnDarwinOnly(t *testing.T) {
+	in := []string{"a.o", "-Wl,-U,_a"}
+	for _, c := range []rewriteCase{
+		{darwinArm, "cc", []string{"a.o"}},
+		{linuxAmd, "aarch64-apple-darwin-cc", []string{"a.o"}},
+		{linuxAmd, "cc", in},
+		{darwinArm, "x86_64-unknown-linux-gnu-cc", in},
+		{darwinArm, "ar", in},
+	} {
+		role, _ := ParseRole(c.role)
+		plan, err := Rewrite(role, in, fakeHost(c.host, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := plan.Args[len(plan.Args)-len(c.want):]; !reflect.DeepEqual(got, c.want) || slices.Contains(c.want, "-Wl,-U,_a") != slices.Contains(plan.Args, "-Wl,-U,_a") {
+			t.Errorf("%v %s: got %q want suffix %q", c.host, c.role, plan.Args, c.want)
+		}
 	}
 }
 
