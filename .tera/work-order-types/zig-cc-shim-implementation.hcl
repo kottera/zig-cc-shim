@@ -17,5 +17,12 @@ version = "v1"
 
 work_order_type "zig-cc-shim-implementation" {
   based_on    = "plugin.dev-pipeline/work-order-types/code-implementation-direct"
+
+  # A type that dispatches a tool resolves to a declared activity partition,
+  # and one is never defaulted (kottera ADR-193 D7). No trigger files this
+  # type, so no worker supplies one: it names the deployment's partition for
+  # development work, the one the dev pipeline's own sessions record into.
+  activity_partition = "dogfood"
+
   description = "Implement a change to kottera/zig-cc-shim end-to-end: branch, change, verify with the repository gate `go run ./cmd/gate` (it prints `gate: ok`; README.md, \"The gate\"), then open and merge the pull request."
 }
