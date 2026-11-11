@@ -15,5 +15,12 @@ version = "v1"
 
 work_order_type "zig-cc-shim-research" {
   based_on    = "plugin.dev-pipeline/work-order-types/code-research"
+
+  # A type that dispatches a tool resolves to a declared activity partition,
+  # and one is never defaulted (kottera ADR-193 D7). No trigger files this
+  # type, so no worker supplies one: it names the deployment's partition for
+  # development work, the one the dev pipeline's own sessions record into.
+  activity_partition = "dogfood"
+
   description = "Investigate a question about kottera/zig-cc-shim, zig or the targets it pins, and produce a structured research report. A spike that builds or tests here is verified with the repository gate `go run ./cmd/gate`, not kottera's `make gate`."
 }
