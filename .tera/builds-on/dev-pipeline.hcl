@@ -7,5 +7,5 @@ version = "v1"
 # declared address into a plugin needs this declaration or the plan refuses it
 # `builds_on_missing` (ADR-158 D1).
 builds_on "dev-pipeline" {
-  major_version = "v3"
+  major_version = "v4"
 }
